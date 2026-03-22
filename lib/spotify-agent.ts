@@ -931,9 +931,14 @@ export class SpotifyAgent {
     try {
       const abs = path.join(/*turbopackIgnore: true*/ process.cwd(), relativePath)
       const content = readFileSync(abs, "utf8")
-      if (content.trim().length > 0) return content
+      if (content.trim().length > 0) {
+        console.log(`[sandbox] script source=repo path=${relativePath}`)
+        return content
+      }
+      console.warn(`[sandbox] script source=fallback (empty file) path=${relativePath}`)
       return fallback
     } catch {
+      console.warn(`[sandbox] script source=fallback (read error) path=${relativePath}`)
       return fallback
     }
   }

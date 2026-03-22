@@ -263,6 +263,37 @@ async function clickPlaylistMenuOption(page) {
   }).catch(() => false);
 }
 
+async function waitForNewPlaylistId(page, beforeIds, maxPolls = 18) {
+  let playlistId = (() => {
+    const m = page.url().match(/\/playlist\/([a-zA-Z0-9]+)/);
+    return m ? m[1] : null;
+  })();
+  for (let i = 0; i < maxPolls && !playlistId; i++) {
+    await page.waitForTimeout(450);
+    playlistId = (() => {
+      const m = page.url().match(/\/playlist\/([a-zA-Z0-9]+)/);
+      return m ? m[1] : null;
+    })();
+    if (playlistId) break;
+    const afterHrefs = await listLibraryPlaylistHrefs(page);
+    const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
+    playlistId = afterIds.find((id) => !beforeIds.includes(id)) || null;
+  }
+  return playlistId;
+}
+
+async function forceCreatePlaylistRetry(page, beforeIds) {
+  await ensurePlaylistsView(page).catch(() => null);
+  await page.waitForTimeout(450);
+  let created = await clickCreatePlaylistHeuristic(page);
+  if (!created) {
+    created = await triggerKeyboardCreatePlaylist(page);
+  }
+  await page.waitForTimeout(650);
+  await clickPlaylistMenuOption(page).catch(() => false);
+  return waitForNewPlaylistId(page, beforeIds, 14);
+}
+
 async function ensureSearchTracksView(page, query) {
   await page.goto('https://open.spotify.com/search/' + encodeURIComponent(query) + '/tracks', {
     waitUntil: 'domcontentloaded',
@@ -674,21 +705,7 @@ try {
   await page.waitForTimeout(700);
   await clickPlaylistMenuOption(page).catch(() => false);
 
-  let playlistId = (() => {
-    const m = page.url().match(/\/playlist\/([a-zA-Z0-9]+)/);
-    return m ? m[1] : null;
-  })();
-  for (let i = 0; i < 18 && !playlistId; i++) {
-    await page.waitForTimeout(450);
-    playlistId = (() => {
-      const m = page.url().match(/\/playlist\/([a-zA-Z0-9]+)/);
-      return m ? m[1] : null;
-    })();
-    if (playlistId) break;
-    const afterHrefs = await listLibraryPlaylistHrefs(page);
-    const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
-    playlistId = afterIds.find((id) => !beforeIds.includes(id)) || null;
-  }
+  let playlistId = await waitForNewPlaylistId(page, beforeIds, 18);
 
   if (!playlistId) {
     const afterHrefs = await listLibraryPlaylistHrefs(page);
@@ -711,6 +728,11 @@ try {
     const afterHrefs = await listLibraryPlaylistHrefs(page);
     const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
     playlistId = afterIds.find((id) => !beforeIds.includes(id)) || null;
+  }
+
+  if (!playlistId) {
+    // Final retry: force a second explicit create cycle.
+    playlistId = await forceCreatePlaylistRetry(page, beforeIds);
   }
 
   if (!playlistId) {
