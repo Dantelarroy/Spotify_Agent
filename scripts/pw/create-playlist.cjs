@@ -608,6 +608,30 @@ try {
       'button[type="submit"]',
       'button:has-text("Save")',
     ], 1500).catch(() => false);
+  } else {
+    // Fallback: direct editable title/header replacement.
+    await page.evaluate((nextName) => {
+      const candidates = [
+        '[data-testid="entityTitle"]',
+        '[data-testid="playlist-title"]',
+        'h1',
+        '[contenteditable="true"]',
+      ];
+      for (const sel of candidates) {
+        const el = document.querySelector(sel);
+        if (!el) continue;
+        const isEditable = el.getAttribute('contenteditable') === 'true';
+        if (isEditable) {
+          el.focus();
+          document.execCommand('selectAll');
+          document.execCommand('insertText', false, nextName);
+          return true;
+        }
+      }
+      return false;
+    }, playlistName).catch(() => false);
+    await page.waitForTimeout(250);
+    await page.keyboard.press('Enter').catch(() => null);
   }
 
   result.phase = 'add_tracks';
