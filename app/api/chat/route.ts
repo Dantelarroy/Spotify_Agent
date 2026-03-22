@@ -19,20 +19,6 @@ export async function POST(req: Request) {
   const { messages }: { messages: UIMessage[] } = await req.json()
   const userId = session.user.id
 
-  const limit = await checkActionLimit(userId)
-  if (!limit.allowed) {
-    return new Response(
-      JSON.stringify({
-        error:
-          limit.reason === "hourly"
-            ? "Rate limit: máximo 10 acciones por hora. Volvé en un momento."
-            : "Límite mensual alcanzado. Actualizá a Pro para acciones ilimitadas.",
-        plan: limit.plan,
-      }),
-      { status: 429, headers: { "Content-Type": "application/json" } }
-    )
-  }
-
   const spotifyCookies = await getSpotifySession(userId)
   if (!spotifyCookies) {
     return new Response(
@@ -41,6 +27,21 @@ export async function POST(req: Request) {
         code: "SPOTIFY_NOT_CONNECTED",
       }),
       { status: 402, headers: { "Content-Type": "application/json" } }
+    )
+  }
+
+  // Only consume quota after we know Spotify session exists.
+  const limit = await checkActionLimit(userId)
+  if (!limit.allowed) {
+    return new Response(
+      JSON.stringify({
+        error:
+          limit.reason === "hourly"
+            ? "Rate limit horario alcanzado. Volvé en un momento."
+            : "Límite mensual alcanzado. Actualizá a Pro para acciones ilimitadas.",
+        plan: limit.plan,
+      }),
+      { status: 429, headers: { "Content-Type": "application/json" } }
     )
   }
 

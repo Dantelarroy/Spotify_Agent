@@ -61,63 +61,78 @@ const HOURLY_LIMIT = 50 // increased for testing
 export async function checkActionLimit(
   userId: string
 ): Promise<{ allowed: boolean; plan: string; remaining: number; reason?: string }> {
-  let sub = await prisma.subscription.findUnique({ where: { userId } })
-  if (!sub) {
-    sub = await prisma.subscription.create({ data: { userId } })
-  }
+  return prisma.$transaction(async (tx) => {
+    let sub = await tx.subscription.findUnique({ where: { userId } })
+    if (!sub) {
+      sub = await tx.subscription.create({ data: { userId } })
+    }
 
-  // Pro users: only hourly rate limit applies
-  if (sub.plan === "pro") {
-    const hourAgo = new Date(Date.now() - 60 * 60 * 1000)
-    if (sub.lastHourStart < hourAgo) {
-      sub = await prisma.subscription.update({
+    const now = new Date()
+    const hourAgo = new Date(now.getTime() - 60 * 60 * 1000)
+    const monthStart = new Date(now)
+    monthStart.setDate(1)
+    monthStart.setHours(0, 0, 0, 0)
+
+    // Normalize period windows inside the same transaction.
+    if (sub.periodStart < monthStart || sub.lastHourStart < hourAgo) {
+      sub = await tx.subscription.update({
         where: { userId },
-        data: { actionsThisHour: 0, lastHourStart: new Date() },
+        data: {
+          ...(sub.periodStart < monthStart ? { messagesThisMonth: 0, periodStart: monthStart } : {}),
+          ...(sub.lastHourStart < hourAgo ? { actionsThisHour: 0, lastHourStart: now } : {}),
+        },
       })
     }
-    if (sub.actionsThisHour >= HOURLY_LIMIT) {
-      return { allowed: false, plan: "pro", remaining: 0, reason: "hourly" }
+
+    if (sub.plan === "pro") {
+      const updated = await tx.subscription.updateMany({
+        where: {
+          userId,
+          actionsThisHour: { lt: HOURLY_LIMIT },
+        },
+        data: { actionsThisHour: { increment: 1 } },
+      })
+
+      if (updated.count === 0) {
+        return { allowed: false, plan: "pro", remaining: 0, reason: "hourly" as const }
+      }
+
+      const after = await tx.subscription.findUnique({
+        where: { userId },
+        select: { actionsThisHour: true },
+      })
+      const remaining = Math.max(0, HOURLY_LIMIT - (after?.actionsThisHour ?? HOURLY_LIMIT))
+      return { allowed: true, plan: "pro", remaining }
     }
-    await prisma.subscription.update({
-      where: { userId },
-      data: { actionsThisHour: { increment: 1 } },
+
+    const updated = await tx.subscription.updateMany({
+      where: {
+        userId,
+        messagesThisMonth: { lt: FREE_MONTHLY_LIMIT },
+        actionsThisHour: { lt: HOURLY_LIMIT },
+      },
+      data: {
+        messagesThisMonth: { increment: 1 },
+        actionsThisHour: { increment: 1 },
+      },
     })
-    return { allowed: true, plan: "pro", remaining: HOURLY_LIMIT - sub.actionsThisHour - 1 }
-  }
 
-  // Free users: monthly limit + hourly rate limit
-  const monthStart = new Date()
-  monthStart.setDate(1)
-  monthStart.setHours(0, 0, 0, 0)
+    if (updated.count === 0) {
+      const current = await tx.subscription.findUnique({
+        where: { userId },
+        select: { messagesThisMonth: true, actionsThisHour: true },
+      })
+      const reason = (current?.actionsThisHour ?? 0) >= HOURLY_LIMIT ? "hourly" : undefined
+      return { allowed: false, plan: "free", remaining: 0, reason }
+    }
 
-  if (sub.periodStart < monthStart) {
-    sub = await prisma.subscription.update({
+    const after = await tx.subscription.findUnique({
       where: { userId },
-      data: { messagesThisMonth: 0, periodStart: monthStart },
+      select: { messagesThisMonth: true },
     })
-  }
-
-  if (sub.messagesThisMonth >= FREE_MONTHLY_LIMIT) {
-    return { allowed: false, plan: "free", remaining: 0 }
-  }
-
-  const hourAgo = new Date(Date.now() - 60 * 60 * 1000)
-  if (sub.lastHourStart < hourAgo) {
-    sub = await prisma.subscription.update({
-      where: { userId },
-      data: { actionsThisHour: 0, lastHourStart: new Date() },
-    })
-  }
-
-  if (sub.actionsThisHour >= HOURLY_LIMIT) {
-    return { allowed: false, plan: "free", remaining: 0, reason: "hourly" }
-  }
-
-  await prisma.subscription.update({
-    where: { userId },
-    data: { messagesThisMonth: { increment: 1 }, actionsThisHour: { increment: 1 } },
+    const remaining = Math.max(0, FREE_MONTHLY_LIMIT - (after?.messagesThisMonth ?? FREE_MONTHLY_LIMIT))
+    return { allowed: true, plan: "free", remaining }
   })
-  return { allowed: true, plan: "free", remaining: FREE_MONTHLY_LIMIT - sub.messagesThisMonth - 1 }
 }
 
 /** @deprecated Use checkActionLimit */

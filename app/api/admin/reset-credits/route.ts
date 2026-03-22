@@ -32,8 +32,14 @@ export async function POST(req: NextRequest) {
   const adminKey = req.headers.get("x-admin-key") || ""
   const expectedAdminKey = process.env.ADMIN_API_KEY || ""
   const hasValidAdminKey = Boolean(expectedAdminKey) && adminKey === expectedAdminKey
+  const isProduction = process.env.VERCEL === "1" || process.env.NODE_ENV === "production"
 
-  if (!callerUserId && !hasValidAdminKey) {
+  // In production this endpoint is admin-only.
+  if (isProduction && !hasValidAdminKey) {
+    return NextResponse.json({ error: "Forbidden (admin key required)" }, { status: 403 })
+  }
+
+  if (!isProduction && !callerUserId && !hasValidAdminKey) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
 
@@ -56,7 +62,7 @@ export async function POST(req: NextRequest) {
 
   const isAdminCall = targetUserId !== callerUserId || Boolean(setPlan) || !callerUserId
 
-  if (isAdminCall) {
+  if (!isProduction && isAdminCall) {
     if (!hasValidAdminKey) {
       return NextResponse.json({ error: "Forbidden (admin key required)" }, { status: 403 })
     }

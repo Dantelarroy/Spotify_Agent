@@ -19,6 +19,8 @@
  */
 
 import { Sandbox } from "@vercel/sandbox"
+import { readFileSync } from "node:fs"
+import path from "node:path"
 
 export interface SpotifyAgentCookie {
   name: string
@@ -925,6 +927,17 @@ export class SpotifyAgent {
     this.cookies = cookies
   }
 
+  private readScriptFromRepo(relativePath: string, fallback: string): string {
+    try {
+      const abs = path.join(/*turbopackIgnore: true*/ process.cwd(), relativePath)
+      const content = readFileSync(abs, "utf8")
+      if (content.trim().length > 0) return content
+      return fallback
+    } catch {
+      return fallback
+    }
+  }
+
   private describeSandboxError(err: unknown): string {
     if (!err || typeof err !== "object") {
       return String(err)
@@ -1103,7 +1116,12 @@ export class SpotifyAgent {
     }
     await sandbox.writeFiles([
       { path: "/tmp/spotify-playlist-input.json", content: Buffer.from(JSON.stringify(input)) },
-      { path: "/tmp/pw-create-playlist.cjs", content: Buffer.from(PLAYWRIGHT_CREATE_PLAYLIST_CJS) },
+      {
+        path: "/tmp/pw-create-playlist.cjs",
+        content: Buffer.from(
+          this.readScriptFromRepo("scripts/pw/create-playlist.cjs", PLAYWRIGHT_CREATE_PLAYLIST_CJS)
+        ),
+      },
     ])
 
     // Detect JS syntax/runtime bootstrap issues early with actionable stderr.
@@ -1216,7 +1234,12 @@ export class SpotifyAgent {
     await this.ensurePlaywrightReady(sandbox)
     await sandbox.writeFiles([
       { path: "/tmp/spotify-control-input.json", content: Buffer.from(JSON.stringify({ ...input, cookies: this.cookies })) },
-      { path: "/tmp/pw-player-control.cjs", content: Buffer.from(PLAYWRIGHT_PLAYER_CONTROL_CJS) },
+      {
+        path: "/tmp/pw-player-control.cjs",
+        content: Buffer.from(
+          this.readScriptFromRepo("scripts/pw/player-control.cjs", PLAYWRIGHT_PLAYER_CONTROL_CJS)
+        ),
+      },
     ])
 
     await this.runSandboxCommand(
