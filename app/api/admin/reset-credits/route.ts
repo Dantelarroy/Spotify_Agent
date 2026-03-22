@@ -6,6 +6,7 @@ export const runtime = "nodejs"
 
 type ResetBody = {
   userId?: string
+  email?: string
   resetMonthly?: boolean
   resetHourly?: boolean
   setPlan?: "free" | "pro"
@@ -13,9 +14,6 @@ type ResetBody = {
 
 export async function POST(req: NextRequest) {
   const session = await auth()
-  if (!session?.user?.id) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
-  }
 
   let body: ResetBody = {}
   try {
@@ -24,9 +22,8 @@ export async function POST(req: NextRequest) {
     body = {}
   }
 
-  const callerUserId = session.user.id
+  const callerUserId = session?.user?.id ?? ""
   const requestedUserId = (body.userId || "").trim()
-  const targetUserId = requestedUserId || callerUserId
 
   const resetMonthly = body.resetMonthly !== false
   const resetHourly = body.resetHourly !== false
@@ -34,10 +31,33 @@ export async function POST(req: NextRequest) {
 
   const adminKey = req.headers.get("x-admin-key") || ""
   const expectedAdminKey = process.env.ADMIN_API_KEY || ""
-  const isAdminCall = targetUserId !== callerUserId || Boolean(setPlan)
+  const hasValidAdminKey = Boolean(expectedAdminKey) && adminKey === expectedAdminKey
+
+  if (!callerUserId && !hasValidAdminKey) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+  }
+
+  let targetUserId = requestedUserId || callerUserId
+  const requestedEmail = (body.email || "").trim()
+  if (!targetUserId && requestedEmail) {
+    const user = await prisma.user.findUnique({
+      where: { email: requestedEmail },
+      select: { id: true },
+    })
+    targetUserId = user?.id ?? ""
+  }
+
+  if (!targetUserId) {
+    return NextResponse.json(
+      { error: "Missing target user. Provide userId or email, or authenticate your session." },
+      { status: 400 }
+    )
+  }
+
+  const isAdminCall = targetUserId !== callerUserId || Boolean(setPlan) || !callerUserId
 
   if (isAdminCall) {
-    if (!expectedAdminKey || adminKey !== expectedAdminKey) {
+    if (!hasValidAdminKey) {
       return NextResponse.json({ error: "Forbidden (admin key required)" }, { status: 403 })
     }
   }
@@ -97,4 +117,3 @@ export async function POST(req: NextRequest) {
     subscription: sub,
   })
 }
-
