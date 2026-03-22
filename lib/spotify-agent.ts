@@ -143,6 +143,8 @@ async function ensurePlaylistsView(page) {
       'a[href*="/collection/playlists"]',
       '[role="tab"][href*="/collection/playlists"]',
       '[role="tablist"] a[href*="playlists"]',
+      'a[href*="playlists"]:has-text("Playlist")',
+      'a[href*="playlists"]:has-text("Lista")',
     ], 1200);
     if (switched) await page.waitForTimeout(700);
   }
@@ -157,6 +159,32 @@ async function clickCreatePlaylistHeuristic(page) {
     'button[aria-label*="create" i]',
   ], 2200);
   if (direct) return true;
+
+  // Try to click library "+" button (often icon-only, locale-independent).
+  const plusClicked = await page.evaluate(() => {
+    const buttons = [...document.querySelectorAll('button,[role="button"]')];
+    const inLibrary = buttons.filter((el) =>
+      el.closest('[data-testid*="library" i],[aria-label*="library" i],[aria-label*="biblioteca" i],nav,aside')
+    );
+    const scored = inLibrary.map((el) => {
+      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+      const testid = (el.getAttribute('data-testid') || '').toLowerCase();
+      const text = (el.textContent || '').toLowerCase().trim();
+      let score = 0;
+      if (testid.includes('add') || testid.includes('create') || testid.includes('plus')) score += 8;
+      if (aria.includes('create') || aria.includes('crear') || aria.includes('new') || aria.includes('nueva')) score += 7;
+      if (aria.includes('playlist') || aria.includes('lista')) score += 6;
+      if (text === '+' || text.includes('playlist') || text.includes('lista')) score += 4;
+      if (el.querySelector('svg')) score += 1;
+      return { el, score };
+    }).sort((a, b) => b.score - a.score);
+
+    const best = scored[0];
+    if (!best || best.score < 3) return false;
+    best.el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    return true;
+  }).catch(() => false);
+  if (plusClicked) return true;
 
   const result = await page.evaluate(() => {
     const terms = ['create', 'new', 'playlist', 'crear', 'nueva', 'lista'];
@@ -194,6 +222,18 @@ async function clickCreatePlaylistHeuristic(page) {
   }).catch(() => ({ clicked: false, bestScore: -1 }));
 
   return Boolean(result?.clicked);
+}
+
+async function triggerKeyboardCreatePlaylist(page) {
+  const combos = ['Control+N', 'Meta+N', 'Control+Shift+N', 'Meta+Shift+N'];
+  for (const combo of combos) {
+    try {
+      await page.keyboard.press(combo);
+      await page.waitForTimeout(450);
+      return true;
+    } catch {}
+  }
+  return false;
 }
 
 async function clickPlaylistMenuOption(page) {
@@ -376,6 +416,11 @@ try {
     // second pass after forcing playlists view again
     await ensurePlaylistsView(page).catch(() => null);
     created = await clickCreatePlaylistHeuristic(page);
+  }
+  if (!created) {
+    // third pass: keyboard shortcut fallback (UI-independent)
+    created = await triggerKeyboardCreatePlaylist(page);
+    await page.waitForTimeout(700);
   }
 
   if (!created) {
