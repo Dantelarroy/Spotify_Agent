@@ -135,8 +135,8 @@ export class SpotifyAgent {
 
   private async injectCookies(sandbox: Sandbox): Promise<void> {
     await sandbox.writeFiles([
-      { path: "/root/cookies.json", content: JSON.stringify(this.cookies) },
-      { path: "/root/inject-cookies.mjs", content: INJECT_COOKIES_MJS },
+      { path: "/root/cookies.json", content: Buffer.from(JSON.stringify(this.cookies)) },
+      { path: "/root/inject-cookies.mjs", content: Buffer.from(INJECT_COOKIES_MJS) },
     ])
     // Primera apertura — arranca Chrome con CDP en puerto 9222
     await sandbox.runCommand("agent-browser", ["open", "about:blank"])
