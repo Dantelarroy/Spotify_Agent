@@ -304,6 +304,31 @@ export class SpotifyAgent {
     return new Promise(r => setTimeout(r, ms))
   }
 
+  private async resolvePlaylistUrlAfterCreate(
+    sandbox: Sandbox,
+    currentUrl: string
+  ): Promise<string | null> {
+    const directId = currentUrl.split("/playlist/")[1]?.split("?")[0]
+    if (directId) return `https://open.spotify.com/playlist/${directId}`
+
+    // Fallback: scrape candidate playlist links from DOM and pick the most likely recent one.
+    const scraped = await this.agentEval(sandbox, `
+      JSON.stringify((() => {
+        const links = [...document.querySelectorAll('a[href^="/playlist/"]')]
+          .map(a => (a.getAttribute('href') || '').split('?')[0])
+          .filter(Boolean);
+        const uniq = [...new Set(links)];
+        return uniq.slice(0, 12);
+      })())
+    `).catch(() => "[]")
+
+    let candidates: string[] = []
+    try { candidates = JSON.parse(scraped) as string[] } catch { /* ignore */ }
+    const first = candidates.find((h) => /^\/playlist\/[a-zA-Z0-9]+$/.test(h))
+    if (!first) return null
+    return `https://open.spotify.com${first}`
+  }
+
   // ─── Public methods ─────────────────────────────────────────────────────────
 
   /**
@@ -395,9 +420,9 @@ export class SpotifyAgent {
         await this.sleep(700)
       }
 
-      const playlistId = url.split("/playlist/")[1]?.split("?")[0]
-      if (!playlistId) throw new Error("Could not navigate to playlist page")
-      const canonicalUrl = `https://open.spotify.com/playlist/${playlistId}`
+      const canonicalUrl = await this.resolvePlaylistUrlAfterCreate(sandbox, url)
+      if (!canonicalUrl) throw new Error("Could not navigate to playlist page")
+      await this.agentOpen(sandbox, canonicalUrl).catch(() => {})
       console.log("[sandbox] playlist created:", canonicalUrl)
 
       // ── Renombrar ─────────────────────────────────────────────────────────

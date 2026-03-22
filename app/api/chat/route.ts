@@ -122,6 +122,7 @@ function buildSystemPrompt(prefs: { blacklist: string[]; whitelist: string[]; no
     "Para búsquedas simples de un tema específico, usá search_spotify.",
     "Para poner a reproducir una canción específica, usá play_track. Ejemplos: 'pon X', 'escuchar X', 'play X'.",
     "Para pausar/reanudar, usá pause. Para saltar canción, usá next_track. Para ver qué suena, usá now_playing.",
+    "IMPORTANTE: nunca digas que una playlist fue creada si create_playlist falló o devolvió error. En ese caso, explicá el fallo y proponé reintentar.",
   ]
   if (prefs.blacklist.length > 0) lines.push(`NUNCA sugerir ni incluir: ${prefs.blacklist.join(", ")}`)
   if (prefs.whitelist.length > 0) lines.push(`Favoritos del usuario: ${prefs.whitelist.join(", ")}`)
