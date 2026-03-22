@@ -70,7 +70,7 @@ export async function POST(req: Request) {
     })
 
     const modelMessages = await safeConvertMessages(messages)
-    const modelName = process.env.ANTHROPIC_MODEL ?? "claude-3-5-haiku-20241022"
+    const modelName = process.env.ANTHROPIC_MODEL ?? "claude-haiku-4-5-20251001"
 
     const result = streamText({
       model: anthropic(modelName),
