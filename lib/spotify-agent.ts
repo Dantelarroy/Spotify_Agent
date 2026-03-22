@@ -97,7 +97,10 @@ const { readFileSync, writeFileSync } = require('node:fs');
 
 function extractPlaylistIdsFromHrefs(hrefs) {
   const ids = hrefs
-    .map((h) => String(h || '').match(/\\/playlist\\/([a-zA-Z0-9]+)/)?.[1] || null)
+    .map((h) => {
+      const m = String(h || '').match(/\\/playlist\\/([a-zA-Z0-9]+)/);
+      return m ? m[1] : null;
+    })
     .filter(Boolean);
   return [...new Set(ids)];
 }
@@ -284,7 +287,10 @@ async function countPlaylistTrackLinks(page, playlistUrl) {
   await page.waitForTimeout(900);
   const total = await page.$$eval('a[href*="/track/"]', (els) => {
     const ids = els
-      .map((el) => String(el.getAttribute('href') || '').match(/\/track\/([a-zA-Z0-9]+)/)?.[1] || null)
+      .map((el) => {
+        const m = String(el.getAttribute('href') || '').match(/\/track\/([a-zA-Z0-9]+)/);
+        return m ? m[1] : null;
+      })
       .filter(Boolean);
     return new Set(ids).size;
   }).catch(() => 0);
@@ -494,10 +500,16 @@ try {
   await page.waitForTimeout(700);
   await clickPlaylistMenuOption(page).catch(() => false);
 
-  let playlistId = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/)?.[1] || null;
+  let playlistId = (() => {
+    const m = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/);
+    return m ? m[1] : null;
+  })();
   for (let i = 0; i < 18 && !playlistId; i++) {
     await page.waitForTimeout(450);
-    playlistId = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/)?.[1] || null;
+    playlistId = (() => {
+      const m = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/);
+      return m ? m[1] : null;
+    })();
     if (playlistId) break;
     const afterHrefs = await listLibraryPlaylistHrefs(page);
     const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
@@ -507,7 +519,10 @@ try {
   if (!playlistId) {
     const afterHrefs = await listLibraryPlaylistHrefs(page);
     const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
-    const currentUrlId = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/)?.[1] || null;
+    const currentUrlId = (() => {
+      const m = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/);
+      return m ? m[1] : null;
+    })();
     if (currentUrlId && !beforeIds.includes(currentUrlId)) {
       playlistId = currentUrlId;
     } else {
