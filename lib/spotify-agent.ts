@@ -1,15 +1,13 @@
 /**
- * SpotifyAgent — Vercel Sandbox + agent-browser (Rust/CDP).
+ * SpotifyAgent — Vercel Sandbox automation for Spotify Web.
  *
  * Arquitectura:
  * 1. @vercel/sandbox crea un microVM Firecracker efímero
- * 2. agent-browser (CLI Rust) controla Chrome via CDP dentro del VM
- * 3. Las cookies de sesión del usuario se inyectan via CDP (Network.setCookies)
- * 4. Acciones: AX tree snapshot → click @ref, con fallback a eval JS
- * 5. Al terminar, el VM se destruye — sin estado residual
+ * 2. Para createPlaylist usa Playwright dentro del VM (robusto ante cambios UI)
+ * 3. Para acciones ligeras mantiene agent-browser (AX/CDP) por costo/latencia
+ * 4. Al terminar, el VM se destruye — sin estado residual
  *
- * Sin screenshots, sin Claude Haiku vision, sin Playwright.
- * NO usa la API oficial de Spotify.
+ * No usa la API oficial de Spotify.
  *
  * Costo objetivo: ~$0.0008 por 15s de CPU (Vercel Fluid Compute).
  * Latencia objetivo: ~15s para playlists simples (con snapshot pre-baked).
@@ -39,7 +37,7 @@ const INJECT_COOKIES_MJS = `
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
 
-const cookies = JSON.parse(readFileSync('/root/cookies.json', 'utf8'));
+const cookies = JSON.parse(readFileSync('/tmp/cookies.json', 'utf8'));
 
 const targets = await new Promise((ok, fail) => {
   http.get('http://localhost:9222/json', (res) => {
@@ -67,6 +65,238 @@ ws.addEventListener('message', ev => {
 });
 ws.addEventListener('error', ev => { console.error('CDP error', ev.message); process.exit(1); });
 setTimeout(() => { if (!done) { console.error('timeout'); process.exit(1); } }, 8000);
+`.trim()
+
+const PLAYWRIGHT_CREATE_PLAYLIST_MJS = `
+import { chromium } from 'playwright';
+import { readFileSync, writeFileSync } from 'node:fs';
+
+function extractPlaylistIdsFromHrefs(hrefs) {
+  const ids = hrefs
+    .map((h) => String(h || '').match(/\\/playlist\\/([a-zA-Z0-9]+)/)?.[1] || null)
+    .filter(Boolean);
+  return [...new Set(ids)];
+}
+
+async function clickFirst(page, selectors, timeout = 1800) {
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    try {
+      if (await locator.count()) {
+        await locator.click({ timeout });
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+
+const input = JSON.parse(readFileSync('/tmp/spotify-playlist-input.json', 'utf8'));
+const result = {
+  ok: false,
+  message: '',
+  url: null,
+  trackCount: 0,
+  phase: '',
+  debug: {},
+};
+
+let browser;
+let page;
+try {
+  browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  });
+  const context = await browser.newContext();
+
+  const cookies = (Array.isArray(input.cookies) ? input.cookies : []).map((c) => {
+    const sameSite = c?.sameSite === 'Strict' || c?.sameSite === 'Lax' || c?.sameSite === 'None'
+      ? c.sameSite
+      : 'Lax';
+    const domain = String(c?.domain || '.spotify.com');
+    return {
+      name: String(c?.name || ''),
+      value: String(c?.value || ''),
+      domain,
+      path: String(c?.path || '/'),
+      httpOnly: Boolean(c?.httpOnly),
+      secure: c?.secure !== false,
+      sameSite,
+      expires: typeof c?.expires === 'number' ? c.expires : undefined,
+    };
+  }).filter((c) => c.name && c.value);
+  if (cookies.length) await context.addCookies(cookies);
+
+  page = await context.newPage();
+  result.phase = 'open_home';
+  await page.goto('https://open.spotify.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(1500);
+
+  const currentUrl = page.url();
+  if (currentUrl.includes('accounts.spotify.com')) {
+    throw new Error('SPOTIFY_NOT_CONNECTED: redirected to accounts.spotify.com');
+  }
+
+  await clickFirst(page, [
+    'button:has-text("Accept cookies")',
+    'button:has-text("Accept")',
+    'button[data-testid*="accept"]',
+  ]).catch(() => false);
+
+  const beforeHrefs = await page.$$eval('a[href*="/playlist/"]', (els) =>
+    [...new Set(els.map((el) => el.getAttribute('href') || ''))]
+  ).catch(() => []);
+  const beforeIds = extractPlaylistIdsFromHrefs(beforeHrefs);
+
+  result.phase = 'create_playlist';
+  let created = await clickFirst(page, [
+    'button[aria-label*="Create playlist" i]',
+    'button[aria-label*="Create a playlist" i]',
+    'button[aria-label*="New playlist" i]',
+    '[data-testid*="create-playlist" i]',
+    'button:has-text("Create playlist")',
+    'button:has-text("New playlist")',
+    'button:has-text("Create")',
+  ], 2500);
+  if (!created) {
+    await page.locator('button,[role="button"],a').evaluateAll((els) => {
+      const target = els.find((el) => {
+        const t = (el.textContent || '').trim().toLowerCase();
+        const a = (el.getAttribute('aria-label') || '').toLowerCase();
+        return t === 'create' || a.includes('create playlist') || a.includes('new playlist');
+      });
+      if (target) target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      return Boolean(target);
+    }).catch(() => false);
+    created = true;
+  }
+
+  await page.waitForTimeout(700);
+  await clickFirst(page, [
+    '[role="menuitem"]:has-text("Playlist")',
+    'button:has-text("Playlist")',
+    '[role="button"]:has-text("Playlist")',
+  ], 1500).catch(() => false);
+
+  let playlistId = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/)?.[1] || null;
+  for (let i = 0; i < 18 && !playlistId; i++) {
+    await page.waitForTimeout(450);
+    playlistId = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/)?.[1] || null;
+    if (playlistId) break;
+    const afterHrefs = await page.$$eval('a[href*="/playlist/"]', (els) =>
+      [...new Set(els.map((el) => el.getAttribute('href') || ''))]
+    ).catch(() => []);
+    const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
+    playlistId = afterIds.find((id) => !beforeIds.includes(id)) || null;
+  }
+
+  if (!playlistId) {
+    const afterHrefs = await page.$$eval('a[href*="/playlist/"]', (els) =>
+      [...new Set(els.map((el) => el.getAttribute('href') || ''))]
+    ).catch(() => []);
+    const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
+    playlistId = afterIds[0] || null;
+  }
+
+  if (!playlistId) {
+    result.debug = {
+      currentUrl: page.url(),
+      beforePlaylistCount: beforeIds.length,
+      phase: result.phase,
+    };
+    throw new Error('Could not navigate to playlist page');
+  }
+
+  const playlistUrl = 'https://open.spotify.com/playlist/' + playlistId;
+  result.phase = 'open_playlist';
+  await page.goto(playlistUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(900);
+
+  result.phase = 'rename_playlist';
+  const playlistName = String(input.name || 'New Playlist');
+  const didOpenEdit = await clickFirst(page, [
+    'button[aria-label*="Edit details" i]',
+    'button[aria-label*="Edit playlist" i]',
+    'button:has-text("Edit details")',
+    'button:has-text("Edit playlist")',
+  ], 1500);
+
+  if (didOpenEdit) {
+    await page.waitForTimeout(500);
+    const nameInput = page.locator('input[name="name"], input[placeholder*="name" i]').first();
+    if (await nameInput.count()) {
+      await nameInput.fill(playlistName, { timeout: 2000 }).catch(() => {});
+    }
+    await clickFirst(page, [
+      'button[aria-label="Save"]',
+      'button[type="submit"]',
+      'button:has-text("Save")',
+    ], 1500).catch(() => false);
+  }
+
+  result.phase = 'add_tracks';
+  const queries = (Array.isArray(input.trackQueries) ? input.trackQueries : [])
+    .map((q) => String(q || '').trim())
+    .filter(Boolean)
+    .slice(0, 50);
+
+  let trackCount = 0;
+  for (const query of queries) {
+    try {
+      await page.goto(
+        'https://open.spotify.com/search/' + encodeURIComponent(query) + '/tracks',
+        { waitUntil: 'domcontentloaded', timeout: 60000 }
+      );
+      await page.waitForTimeout(700);
+      const row = page.locator('[data-testid="tracklist-row"], [role="row"]').first();
+      if (!(await row.count())) continue;
+      await row.hover({ timeout: 1500 }).catch(() => {});
+      await row.locator('button[aria-label*="More options" i], [data-testid="more-button"], button[aria-haspopup="menu"]')
+        .first()
+        .click({ timeout: 1800 });
+      const addMenuItem = page.locator('[role="menuitem"]').filter({ hasText: /Add to playlist/i }).first();
+      if (await addMenuItem.count()) {
+        await addMenuItem.click({ timeout: 1800 });
+      } else {
+        continue;
+      }
+      await page.waitForTimeout(350);
+      const playlistOption = page.locator('[role="menuitem"], [role="option"]').filter({ hasText: playlistName }).first();
+      if (await playlistOption.count()) {
+        await playlistOption.click({ timeout: 1800 });
+        trackCount++;
+      }
+      await page.waitForTimeout(250);
+    } catch {}
+  }
+
+  result.ok = true;
+  result.message = 'ok';
+  result.url = playlistUrl;
+  result.trackCount = trackCount;
+} catch (err) {
+  result.ok = false;
+  result.message = err instanceof Error ? err.message : String(err);
+  try {
+    if (page) {
+      const screenshotPath = '/tmp/spotify-playlist-error.png';
+      const htmlPath = '/tmp/spotify-playlist-error.html';
+      await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+      writeFileSync(htmlPath, await page.content(), 'utf8');
+      result.debug = {
+        ...result.debug,
+        currentUrl: page.url(),
+        screenshotPath,
+        htmlPath,
+      };
+    }
+  } catch {}
+} finally {
+  if (browser) await browser.close().catch(() => {});
+}
+
+console.log('SPOTIFY_PW_RESULT=' + JSON.stringify(result));
 `.trim()
 
 // Dependencias del sistema para Chromium en Fedora (runtime Vercel Sandbox)
@@ -190,6 +420,94 @@ export class SpotifyAgent {
     await sb.runCommand("npx", ["agent-browser", "install"])
     console.log("[sandbox] bootstrap done")
     return sb
+  }
+
+  private async ensurePlaywrightReady(sandbox: Sandbox): Promise<void> {
+    const probe = await this.runSandboxCommand(
+      sandbox,
+      "playwright-probe",
+      "sh",
+      ["-lc", "export NODE_PATH=$(npm root -g); node -e \"require('playwright'); console.log('ok')\""],
+      0
+    ).catch(() => null)
+    if (probe) return
+
+    console.log("[sandbox] installing playwright (one-time per sandbox)")
+    await this.runSandboxCommand(
+      sandbox,
+      "install-playwright-package",
+      "npm",
+      ["install", "-g", "playwright"],
+      1
+    )
+    await this.runSandboxCommand(
+      sandbox,
+      "install-playwright-browser",
+      "npx",
+      ["playwright", "install", "chromium"],
+      1
+    )
+  }
+
+  private async runPlaywrightPlaylistFlow(
+    sandbox: Sandbox,
+    name: string,
+    description: string,
+    trackQueries: string[]
+  ): Promise<{ url: string; trackCount: number }> {
+    await this.ensurePlaywrightReady(sandbox)
+
+    const input = {
+      name,
+      description,
+      trackQueries,
+      cookies: this.cookies,
+    }
+    await sandbox.writeFiles([
+      { path: "/tmp/spotify-playlist-input.json", content: Buffer.from(JSON.stringify(input)) },
+      { path: "/tmp/pw-create-playlist.mjs", content: Buffer.from(PLAYWRIGHT_CREATE_PLAYLIST_MJS) },
+    ])
+
+    const run = await this.runSandboxCommand(
+      sandbox,
+      "playwright-create-playlist",
+      "sh",
+      ["-lc", "export NODE_PATH=$(npm root -g); node /tmp/pw-create-playlist.mjs"],
+      0
+    )
+    const stdout = await run.stdout()
+    const stderr = await run.stderr()
+    if (stderr?.trim()) {
+      console.error("[sandbox][playwright] stderr:", stderr.slice(0, 600))
+    }
+
+    const marker = "SPOTIFY_PW_RESULT="
+    const line = stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l.startsWith(marker))
+    if (!line) {
+      throw new Error(`Playwright result not found in sandbox output: ${stdout.slice(-400)}`)
+    }
+    const parsed = JSON.parse(line.slice(marker.length)) as {
+      ok: boolean
+      message?: string
+      url?: string | null
+      trackCount?: number
+      phase?: string
+      debug?: Record<string, unknown>
+    }
+
+    if (!parsed.ok || !parsed.url) {
+      const detail = parsed.debug ? ` debug=${JSON.stringify(parsed.debug).slice(0, 500)}` : ""
+      const phase = parsed.phase ? ` phase=${parsed.phase}` : ""
+      throw new Error(`PLAYLIST_CREATE_FAILED:${parsed.message ?? "unknown"}${phase}${detail}`)
+    }
+
+    return {
+      url: parsed.url,
+      trackCount: parsed.trackCount ?? 0,
+    }
   }
 
   // ─── Cookie injection via CDP ───────────────────────────────────────────────
@@ -417,108 +735,10 @@ export class SpotifyAgent {
     trackQueries: string[]
   ): Promise<{ url: string; trackCount: number }> {
     return this.withSandbox(async (sandbox) => {
-      console.log("[sandbox] injecting session and loading Spotify")
-      await this.injectCookies(sandbox)
-      await this.agentOpen(sandbox, "https://open.spotify.com")
-
-      let url = await this.agentGetUrl(sandbox)
-      this.assertNotLogin(url)
-      await this.sleep(2000) // Web Player initialization
-      const knownPlaylistIdsBefore = await this.readVisiblePlaylistIds(sandbox).catch(() => [])
-
-      // ── Cookie banner ─────────────────────────────────────────────────────
-      await this.findAndClick(
-        sandbox,
-        ["Accept cookies", "Accept", "Reject"],
-        `document.querySelector('[id*="accept" i],[data-testid*="accept" i]')?.click()`
-      ).catch(() => {})
-
-      // ── Crear playlist ────────────────────────────────────────────────────
-      console.log("[sandbox] creating playlist")
-      const createAttempts: Array<{
-        labels: string[]
-        fallbackJs: string
-      }> = [
-        {
-          labels: ["Create playlist", "Create a playlist", "New playlist"],
-          fallbackJs: `(() => {
-            const btn = document.querySelector(
-              '[aria-label*="Create playlist" i],[aria-label*="Create a playlist" i],[aria-label*="New playlist" i],[data-testid*="create-playlist" i]'
-            );
-            if (!btn) return false;
-            btn.click();
-            return true;
-          })()`,
-        },
-        {
-          labels: ["Create", "Your Library"],
-          fallbackJs: `(() => {
-            const controls = [
-              ...document.querySelectorAll('button,[role="button"],a')
-            ];
-            const btn = controls.find((el) => {
-              const t = (el.textContent || '').trim().toLowerCase();
-              const a = (el.getAttribute('aria-label') || '').trim().toLowerCase();
-              return t === 'create' || a.includes('create playlist') || a.includes('new playlist');
-            });
-            if (!btn) return false;
-            btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-            return true;
-          })()`,
-        },
-      ]
-
-      let canonicalUrl: string | null = null
-      for (const attempt of createAttempts) {
-        await this.findAndClick(sandbox, attempt.labels, attempt.fallbackJs).catch(() => false)
-        await this.sleep(900)
-
-        // Si aparece dropdown con "Playlist / Blend / Folder"
-        await this.findAndClick(
-          sandbox,
-          ["Playlist"],
-          `(() => {
-            const item = [...document.querySelectorAll('[role="menuitem"],button,[role="button"]')]
-              .find(el => (el.textContent || '').trim().toLowerCase() === 'playlist');
-            if (!item) return false;
-            item.click();
-            return true;
-          })()`
-        ).catch(() => false)
-        await this.sleep(1300)
-
-        // Esperar navegación o aparición de nuevo playlistId en sidebar
-        for (let i = 0; i < 8; i++) {
-          url = await this.agentGetUrl(sandbox)
-          canonicalUrl = await this.resolvePlaylistUrlAfterCreate(sandbox, url, knownPlaylistIdsBefore)
-          if (canonicalUrl) break
-          await this.sleep(600)
-        }
-
-        if (canonicalUrl) break
-      }
-
-      if (!canonicalUrl) throw new Error("Could not navigate to playlist page")
-      await this.agentOpen(sandbox, canonicalUrl).catch(() => {})
-      console.log("[sandbox] playlist created:", canonicalUrl)
-
-      // ── Renombrar ─────────────────────────────────────────────────────────
-      console.log("[sandbox] renaming to:", name)
-      await this.renamePlaylist(sandbox, name)
-
-      // ── Agregar tracks ────────────────────────────────────────────────────
-      console.log("[sandbox] adding", trackQueries.length, "tracks")
-      let trackCount = 0
-      for (const query of trackQueries.slice(0, 50)) {
-        try {
-          if (await this.addOneTrack(sandbox, query, name)) trackCount++
-        } catch (e) {
-          console.log("[sandbox] track failed:", query, String(e).slice(0, 60))
-        }
-      }
-
-      console.log("[sandbox] done. tracks:", trackCount)
-      return { url: canonicalUrl, trackCount }
+      console.log("[sandbox] creating playlist via Playwright flow")
+      const created = await this.runPlaywrightPlaylistFlow(sandbox, name, description, trackQueries)
+      console.log("[sandbox] playlist created:", created.url, "tracks:", created.trackCount)
+      return created
     }, 600_000) // 10 min para playlists grandes
   }
 
@@ -732,6 +952,8 @@ export class SpotifyAgent {
     ])
     await sb.runCommand("npm", ["install", "-g", "agent-browser"])
     await sb.runCommand("npx", ["agent-browser", "install"])
+    await sb.runCommand("npm", ["install", "-g", "playwright"])
+    await sb.runCommand("npx", ["playwright", "install", "chromium"])
     const snap = await sb.snapshot()
     console.log("[sandbox] snapshot ID:", snap.snapshotId)
     console.log("[sandbox] set AGENT_BROWSER_SNAPSHOT_ID=" + snap.snapshotId)
