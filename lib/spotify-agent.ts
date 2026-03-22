@@ -98,7 +98,7 @@ const { readFileSync, writeFileSync } = require('node:fs');
 function extractPlaylistIdsFromHrefs(hrefs) {
   const ids = hrefs
     .map((h) => {
-      const m = String(h || '').match(/\\/playlist\\/([a-zA-Z0-9]+)/);
+      const m = String(h || '').match(/\/playlist\/([a-zA-Z0-9]+)/);
       return m ? m[1] : null;
     })
     .filter(Boolean);
@@ -108,7 +108,7 @@ function extractPlaylistIdsFromHrefs(hrefs) {
 function normalizeName(text) {
   return String(text || '')
     .toLowerCase()
-    .replace(/\\s+/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim();
 }
 
@@ -501,13 +501,13 @@ try {
   await clickPlaylistMenuOption(page).catch(() => false);
 
   let playlistId = (() => {
-    const m = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/);
+    const m = page.url().match(/\/playlist\/([a-zA-Z0-9]+)/);
     return m ? m[1] : null;
   })();
   for (let i = 0; i < 18 && !playlistId; i++) {
     await page.waitForTimeout(450);
     playlistId = (() => {
-      const m = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/);
+      const m = page.url().match(/\/playlist\/([a-zA-Z0-9]+)/);
       return m ? m[1] : null;
     })();
     if (playlistId) break;
@@ -520,7 +520,7 @@ try {
     const afterHrefs = await listLibraryPlaylistHrefs(page);
     const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
     const currentUrlId = (() => {
-      const m = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/);
+      const m = page.url().match(/\/playlist\/([a-zA-Z0-9]+)/);
       return m ? m[1] : null;
     })();
     if (currentUrlId && !beforeIds.includes(currentUrlId)) {
