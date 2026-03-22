@@ -72,6 +72,14 @@ export default function ChatPage() {
   const isSpotifyError = error?.message?.includes("SPOTIFY_NOT_CONNECTED") ||
     error?.message?.includes("402") ||
     error?.message?.includes("Spotify no conectado")
+  const isAuthError =
+    error?.message?.includes("UNAUTHORIZED") ||
+    error?.message?.includes("401") ||
+    error?.message?.toLowerCase().includes("sesión expirada")
+  const isModelCreditsError =
+    error?.message?.includes("MODEL_CREDITS_EXHAUSTED") ||
+    error?.message?.toLowerCase().includes("insufficient credits") ||
+    error?.message?.toLowerCase().includes("credit balance is too low")
 
   // Not connected state
   if (spotifyConnected === false) {
@@ -202,8 +210,12 @@ export default function ChatPage() {
             <div className="px-4 py-2 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
               {error.message?.includes("429")
                 ? "Límite alcanzado. Upgrade a Pro para acciones ilimitadas."
+                : isAuthError
+                ? "Tu sesión venció. Recargá e iniciá sesión de nuevo."
                 : isSpotifyError
                 ? <span>Spotify desconectado. <Link href="/connect-spotify" className="underline">Reconectá tu cuenta</Link>.</span>
+                : isModelCreditsError
+                ? "El proveedor de IA no tiene crédito/configuración suficiente. Revisá ANTHROPIC_API_KEY o billing."
                 : "Error al conectar. Intentá de nuevo."}
             </div>
           </div>

@@ -11,71 +11,90 @@ export const runtime = "nodejs"
 export const maxDuration = 300
 
 export async function POST(req: Request) {
-  const session = await auth()
-  if (!session?.user?.id) {
-    return new Response("Unauthorized", { status: 401 })
-  }
-
-  const { messages }: { messages: UIMessage[] } = await req.json()
-  const userId = session.user.id
-
-  const spotifyCookies = await getSpotifySession(userId)
-  if (!spotifyCookies) {
-    return new Response(
-      JSON.stringify({
-        error: "Spotify no conectado. Conectá tu cuenta primero.",
-        code: "SPOTIFY_NOT_CONNECTED",
-      }),
-      { status: 402, headers: { "Content-Type": "application/json" } }
-    )
-  }
-
-  // Only consume quota after we know Spotify session exists.
-  const limit = await checkActionLimit(userId)
-  if (!limit.allowed) {
-    return new Response(
-      JSON.stringify({
-        error:
-          limit.reason === "hourly"
-            ? "Rate limit horario alcanzado. Volvé en un momento."
-            : "Límite mensual alcanzado. Actualizá a Pro para acciones ilimitadas.",
-        plan: limit.plan,
-      }),
-      { status: 429, headers: { "Content-Type": "application/json" } }
-    )
-  }
-
-  const prefs = await getPreferences(userId)
-
-  let agent
   try {
-    agent = createAgent(spotifyCookies)
-  } catch {
-    return new Response(
-      JSON.stringify({
-        error: "Sesión de Spotify expirada. Reconectá tu cuenta.",
-        code: "SPOTIFY_NOT_CONNECTED",
-      }),
-      { status: 402, headers: { "Content-Type": "application/json" } }
-    )
+    const session = await auth()
+    if (!session?.user?.id) {
+      return new Response(
+        JSON.stringify({ error: "Sesión expirada. Iniciá sesión nuevamente.", code: "UNAUTHORIZED" }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      )
+    }
+
+    const { messages }: { messages: UIMessage[] } = await req.json()
+    const userId = session.user.id
+
+    const spotifyCookies = await getSpotifySession(userId)
+    if (!spotifyCookies) {
+      return new Response(
+        JSON.stringify({
+          error: "Spotify no conectado. Conectá tu cuenta primero.",
+          code: "SPOTIFY_NOT_CONNECTED",
+        }),
+        { status: 402, headers: { "Content-Type": "application/json" } }
+      )
+    }
+
+    // Only consume quota after we know Spotify session exists.
+    const limit = await checkActionLimit(userId)
+    if (!limit.allowed) {
+      return new Response(
+        JSON.stringify({
+          error:
+            limit.reason === "hourly"
+              ? "Rate limit horario alcanzado. Volvé en un momento."
+              : "Límite mensual alcanzado. Actualizá a Pro para acciones ilimitadas.",
+          plan: limit.plan,
+        }),
+        { status: 429, headers: { "Content-Type": "application/json" } }
+      )
+    }
+
+    const prefs = await getPreferences(userId)
+
+    let agent
+    try {
+      agent = createAgent(spotifyCookies)
+    } catch {
+      return new Response(
+        JSON.stringify({
+          error: "Sesión de Spotify expirada. Reconectá tu cuenta.",
+          code: "SPOTIFY_NOT_CONNECTED",
+        }),
+        { status: 402, headers: { "Content-Type": "application/json" } }
+      )
+    }
+
+    const tools = createTools(agent, userId, prefs, async () => {
+      // Called when agent detects session expired — marks DB so sidebar updates
+      await invalidateSpotifySession(userId)
+    })
+
+    const modelMessages = await safeConvertMessages(messages)
+    const modelName = process.env.ANTHROPIC_MODEL ?? "claude-3-5-haiku-latest"
+
+    const result = streamText({
+      model: anthropic(modelName),
+      system: buildSystemPrompt(prefs),
+      messages: modelMessages,
+      tools,
+      stopWhen: stepCountIs(10),
+    })
+
+    return result.toUIMessageStreamResponse({
+      onError: (error) => {
+        const normalized = normalizeChatError(error)
+        console.error("[api/chat] stream error:", normalized.log)
+        return normalized.publicMessage
+      },
+    })
+  } catch (error) {
+    const normalized = normalizeChatError(error)
+    console.error("[api/chat] fatal error:", normalized.log)
+    return new Response(JSON.stringify({ error: normalized.publicMessage, code: normalized.code }), {
+      status: normalized.status,
+      headers: { "Content-Type": "application/json" },
+    })
   }
-
-  const tools = createTools(agent, userId, prefs, async () => {
-    // Called when agent detects session expired — marks DB so sidebar updates
-    await invalidateSpotifySession(userId)
-  })
-
-  const modelMessages = await safeConvertMessages(messages)
-
-  const result = streamText({
-    model: anthropic("claude-3-5-haiku-latest"),
-    system: buildSystemPrompt(prefs),
-    messages: modelMessages,
-    tools,
-    stopWhen: stepCountIs(10),
-  })
-
-  return result.toUIMessageStreamResponse()
 }
 
 async function safeConvertMessages(messages: UIMessage[]) {
@@ -130,4 +149,62 @@ function buildSystemPrompt(prefs: { blacklist: string[]; whitelist: string[]; no
   if (prefs.whitelist.length > 0) lines.push(`Favoritos del usuario: ${prefs.whitelist.join(", ")}`)
   if (prefs.notes.length > 0) lines.push(`Notas: ${prefs.notes.join("; ")}`)
   return lines.join("\n")
+}
+
+function normalizeChatError(error: unknown): {
+  publicMessage: string
+  status: number
+  code: string
+  log: string
+} {
+  const raw = error instanceof Error ? error.message : String(error)
+  const msg = raw.toLowerCase()
+
+  if (msg.includes("spotify_not_connected")) {
+    return {
+      publicMessage: "SPOTIFY_NOT_CONNECTED: Sesión de Spotify expirada. Reconectá tu cuenta.",
+      status: 402,
+      code: "SPOTIFY_NOT_CONNECTED",
+      log: raw,
+    }
+  }
+
+  if (msg.includes("unauthorized") || msg.includes("jwt") || msg.includes("session")) {
+    return {
+      publicMessage: "UNAUTHORIZED: Sesión expirada. Iniciá sesión nuevamente.",
+      status: 401,
+      code: "UNAUTHORIZED",
+      log: raw,
+    }
+  }
+
+  if (msg.includes("429") || msg.includes("rate limit")) {
+    return {
+      publicMessage: "RATE_LIMIT: Se alcanzó el límite temporal. Reintentá en un momento.",
+      status: 429,
+      code: "RATE_LIMIT",
+      log: raw,
+    }
+  }
+
+  if (
+    msg.includes("credit balance is too low") ||
+    msg.includes("insufficient credits") ||
+    msg.includes("billing") ||
+    msg.includes("payment required")
+  ) {
+    return {
+      publicMessage: "MODEL_CREDITS_EXHAUSTED: El proveedor del modelo se quedó sin crédito.",
+      status: 503,
+      code: "MODEL_CREDITS_EXHAUSTED",
+      log: raw,
+    }
+  }
+
+  return {
+    publicMessage: `SERVER_ERROR: ${raw.slice(0, 220)}`,
+    status: 500,
+    code: "SERVER_ERROR",
+    log: raw,
+  }
 }
