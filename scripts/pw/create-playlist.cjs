@@ -211,10 +211,14 @@ async function ensureSearchTracksView(page, query) {
 
   await clickFirst(page, [
     'a[href*="/tracks"]',
+    'button[href*="/tracks"]',
     '[role="tab"]:has-text("Tracks")',
     '[role="tab"]:has-text("Songs")',
     '[role="tab"]:has-text("Canciones")',
     '[role="tab"]:has-text("Musicas")',
+    'button:has-text("Tracks")',
+    'button:has-text("Songs")',
+    'button:has-text("Canciones")',
   ], 1200);
   await page.waitForTimeout(350);
   if (page.url().includes('accounts.spotify.com')) {
@@ -238,11 +242,15 @@ async function ensureSearchTracksView(page, query) {
     await page.waitForTimeout(500);
     await clickFirst(page, [
       'a[href*="/tracks"]',
+      'button[href*="/tracks"]',
       '[role="tab"]:has-text("Tracks")',
       '[role="tab"]:has-text("Songs")',
       '[role="tab"]:has-text("Canciones")',
       '[role="tab"]:has-text("Músicas")',
       '[role="tab"]:has-text("Musicas")',
+      'button:has-text("Tracks")',
+      'button:has-text("Songs")',
+      'button:has-text("Canciones")',
     ], 1200).catch(() => false);
     await page.waitForTimeout(400);
   }
@@ -316,14 +324,35 @@ async function addFirstSearchResultToPlaylist(page, playlistId, playlistName) {
     '[data-testid="tracklist-row"]',
     '[role="row"]:has(button[aria-haspopup="menu"])',
     '[role="row"]',
+    'main [data-testid*="track" i]',
   ].join(',')).first();
-  if (!(await row.count())) return { ok: false, reason: 'no_track_row' };
+  const firstTrackLink = page.locator('main a[href*="/track/"], a[href*="/track/"]').first();
+  const hasRow = await row.count();
+  const hasTrackLink = await firstTrackLink.count();
+  if (!hasRow && !hasTrackLink) return { ok: false, reason: 'no_track_row' };
 
-  await row.hover({ timeout: 1500 }).catch(() => null);
-  const more = row.locator('button[aria-label*="More options" i], [data-testid="more-button"], button[aria-haspopup="menu"]').first();
-  if (!(await more.count())) return { ok: false, reason: 'no_more_button' };
-  await more.click({ timeout: 1800 }).catch(() => null);
-  await page.waitForTimeout(220);
+  let menuOpened = false;
+  if (hasRow) {
+    await row.hover({ timeout: 1500 }).catch(() => null);
+    const more = row.locator('button[aria-label*="More options" i], [data-testid="more-button"], button[aria-haspopup="menu"]').first();
+    if (await more.count()) {
+      await more.click({ timeout: 1800 }).catch(() => null);
+      await page.waitForTimeout(220);
+      menuOpened = true;
+    }
+  }
+  if (!menuOpened && hasTrackLink) {
+    await firstTrackLink.click({ button: 'right', timeout: 1800 }).catch(() => null);
+    await page.waitForTimeout(260);
+    menuOpened = await page.locator('[role="menu"], [role="menuitem"]').count().then((c) => c > 0).catch(() => false);
+  }
+  if (!menuOpened && hasTrackLink) {
+    await firstTrackLink.focus().catch(() => null);
+    await page.keyboard.press('Shift+F10').catch(() => null);
+    await page.waitForTimeout(260);
+    menuOpened = await page.locator('[role="menu"], [role="menuitem"]').count().then((c) => c > 0).catch(() => false);
+  }
+  if (!menuOpened) return { ok: false, reason: 'no_more_button' };
 
   // Strategy A: direct hit by playlist ID link if visible immediately.
   const directById = page.locator('a[href*="/playlist/' + playlistId + '"]').first();
@@ -334,6 +363,13 @@ async function addFirstSearchResultToPlaylist(page, playlistId, playlistName) {
 
   // Strategy B: open/hover likely "Add to playlist" menuitem (language agnostic).
   const addTerms = ['add', 'añadir', 'agregar', 'adicionar', 'aggiungi', 'ajouter', 'hinzuf'];
+  const addMenuClicked = await clickFirst(page, [
+    '[role="menuitem"]:has-text("Add to playlist")',
+    '[role="menuitem"]:has-text("Añadir a playlist")',
+    '[role="menuitem"]:has-text("Agregar a playlist")',
+    '[role="menuitem"]:has-text("Add to")',
+  ], 1200);
+  if (addMenuClicked) await page.waitForTimeout(260);
   const items = page.locator('[role="menuitem"]');
   const itemCount = await items.count();
   let submenuOpened = false;

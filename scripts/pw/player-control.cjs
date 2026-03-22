@@ -36,10 +36,14 @@ async function ensureSearchTracksView(page, query) {
   if (page.url().includes('/tracks')) return;
   await clickFirst(page, [
     'a[href*="/tracks"]',
+    'button[href*="/tracks"]',
     '[role="tab"]:has-text("Tracks")',
     '[role="tab"]:has-text("Songs")',
     '[role="tab"]:has-text("Canciones")',
     '[role="tab"]:has-text("Musicas")',
+    'button:has-text("Tracks")',
+    'button:has-text("Songs")',
+    'button:has-text("Canciones")',
   ], 1200);
   await page.waitForTimeout(350);
   if (page.url().includes('accounts.spotify.com')) {
@@ -62,11 +66,15 @@ async function ensureSearchTracksView(page, query) {
     await page.waitForTimeout(500);
     await clickFirst(page, [
       'a[href*="/tracks"]',
+      'button[href*="/tracks"]',
       '[role="tab"]:has-text("Tracks")',
       '[role="tab"]:has-text("Songs")',
       '[role="tab"]:has-text("Canciones")',
       '[role="tab"]:has-text("Músicas")',
       '[role="tab"]:has-text("Musicas")',
+      'button:has-text("Tracks")',
+      'button:has-text("Songs")',
+      'button:has-text("Canciones")',
     ], 1200).catch(() => false);
     await page.waitForTimeout(400);
   }
@@ -150,7 +158,17 @@ let page;
       const query = String(input.query || '');
       await ensureSearchTracksView(page, query);
       const candidates = await collectTrackCandidates(page, 10);
-      if (!candidates.length) throw new Error('No tracks found on search page');
+      if (!candidates.length) {
+        const playedAny = await clickFirst(page, [
+          'main [data-testid="play-button"]',
+          '[data-testid="play-button"]',
+          'main button[aria-label*="Play" i]',
+        ], 1600);
+        if (!playedAny) throw new Error('No tracks found on search page');
+        result.ok = true;
+        result.data = { name: query, artist: '' };
+        return;
+      }
       const first = candidates[0];
 
       // Prefer explicit row play button, fallback to open track link and hit top play.
