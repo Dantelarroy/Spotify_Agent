@@ -435,33 +435,69 @@ export class SpotifyAgent {
 
       // ── Crear playlist ────────────────────────────────────────────────────
       console.log("[sandbox] creating playlist")
-      await this.findAndClick(
-        sandbox,
-        ["Create playlist", "New playlist"],
-        `document.querySelector('[aria-label*="Create playlist" i],[aria-label*="New playlist" i]')?.click()`
-      )
-      await this.sleep(600)
+      const createAttempts: Array<{
+        labels: string[]
+        fallbackJs: string
+      }> = [
+        {
+          labels: ["Create playlist", "Create a playlist", "New playlist"],
+          fallbackJs: `(() => {
+            const btn = document.querySelector(
+              '[aria-label*="Create playlist" i],[aria-label*="Create a playlist" i],[aria-label*="New playlist" i],[data-testid*="create-playlist" i]'
+            );
+            if (!btn) return false;
+            btn.click();
+            return true;
+          })()`,
+        },
+        {
+          labels: ["Create", "Your Library"],
+          fallbackJs: `(() => {
+            const controls = [
+              ...document.querySelectorAll('button,[role="button"],a')
+            ];
+            const btn = controls.find((el) => {
+              const t = (el.textContent || '').trim().toLowerCase();
+              const a = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+              return t === 'create' || a.includes('create playlist') || a.includes('new playlist');
+            });
+            if (!btn) return false;
+            btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            return true;
+          })()`,
+        },
+      ]
 
-      // Si aparece dropdown con "Playlist / Blend / Folder"
-      await this.findAndClick(
-        sandbox,
-        ["Playlist"],
-        `[...document.querySelectorAll('[role="menuitem"]')].find(el => el.textContent?.trim() === 'Playlist')?.click()`
-      ).catch(() => {})
-      await this.sleep(1500)
+      let canonicalUrl: string | null = null
+      for (const attempt of createAttempts) {
+        await this.findAndClick(sandbox, attempt.labels, attempt.fallbackJs).catch(() => false)
+        await this.sleep(900)
 
-      // Esperar navegación a /playlist/{id}
-      for (let i = 0; i < 12; i++) {
-        url = await this.agentGetUrl(sandbox)
-        if (url.includes("/playlist/")) break
-        await this.sleep(700)
+        // Si aparece dropdown con "Playlist / Blend / Folder"
+        await this.findAndClick(
+          sandbox,
+          ["Playlist"],
+          `(() => {
+            const item = [...document.querySelectorAll('[role="menuitem"],button,[role="button"]')]
+              .find(el => (el.textContent || '').trim().toLowerCase() === 'playlist');
+            if (!item) return false;
+            item.click();
+            return true;
+          })()`
+        ).catch(() => false)
+        await this.sleep(1300)
+
+        // Esperar navegación o aparición de nuevo playlistId en sidebar
+        for (let i = 0; i < 8; i++) {
+          url = await this.agentGetUrl(sandbox)
+          canonicalUrl = await this.resolvePlaylistUrlAfterCreate(sandbox, url, knownPlaylistIdsBefore)
+          if (canonicalUrl) break
+          await this.sleep(600)
+        }
+
+        if (canonicalUrl) break
       }
 
-      const canonicalUrl = await this.resolvePlaylistUrlAfterCreate(
-        sandbox,
-        url,
-        knownPlaylistIdsBefore
-      )
       if (!canonicalUrl) throw new Error("Could not navigate to playlist page")
       await this.agentOpen(sandbox, canonicalUrl).catch(() => {})
       console.log("[sandbox] playlist created:", canonicalUrl)
