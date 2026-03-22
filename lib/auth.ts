@@ -36,7 +36,7 @@ export const authConfig = {
         httpOnly: true,
         sameSite: "lax" as const,
         path: "/",
-        secure: false,
+        secure: true,
       },
     },
   },
