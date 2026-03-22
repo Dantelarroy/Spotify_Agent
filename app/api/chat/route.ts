@@ -67,7 +67,7 @@ export async function POST(req: Request) {
   const modelMessages = await safeConvertMessages(messages)
 
   const result = streamText({
-    model: anthropic("claude-sonnet-4-6"),
+    model: anthropic("claude-3-5-haiku-latest"),
     system: buildSystemPrompt(prefs),
     messages: modelMessages,
     tools,
