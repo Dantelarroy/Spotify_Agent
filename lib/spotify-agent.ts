@@ -304,21 +304,48 @@ export class SpotifyAgent {
     return new Promise(r => setTimeout(r, ms))
   }
 
+  private extractPlaylistId(href: string): string | null {
+    const m = href.match(/\/playlist\/([a-zA-Z0-9]+)/)
+    return m?.[1] ?? null
+  }
+
+  private async readVisiblePlaylistIds(sandbox: Sandbox): Promise<string[]> {
+    const raw = await this.agentEval(sandbox, `
+      JSON.stringify((() => {
+        const hrefs = [...document.querySelectorAll('a[href*="/playlist/"]')]
+          .map(a => a.getAttribute('href') || '')
+          .filter(Boolean);
+        return [...new Set(hrefs)].slice(0, 80);
+      })())
+    `).catch(() => "[]")
+
+    let parsed: unknown = []
+    try { parsed = JSON.parse(raw) } catch { /* ignore */ }
+    const hrefs = Array.isArray(parsed)
+      ? parsed.filter((v): v is string => typeof v === "string")
+      : []
+    const ids = hrefs
+      .map((href) => this.extractPlaylistId(href))
+      .filter((v): v is string => Boolean(v))
+    return [...new Set(ids)]
+  }
+
   private async resolvePlaylistUrlAfterCreate(
     sandbox: Sandbox,
-    currentUrl: string
+    currentUrl: string,
+    knownPlaylistIdsBefore: string[]
   ): Promise<string | null> {
-    const directId = currentUrl.split("/playlist/")[1]?.split("?")[0]
+    const directId = this.extractPlaylistId(currentUrl)
     if (directId) return `https://open.spotify.com/playlist/${directId}`
 
-    // Fallback: scrape candidate playlist links from DOM and pick the most likely recent one.
+    // Fallback: scrape candidate links and infer the newly created playlist.
     const scraped = await this.agentEval(sandbox, `
       JSON.stringify((() => {
-        const links = [...document.querySelectorAll('a[href^="/playlist/"]')]
-          .map(a => (a.getAttribute('href') || '').split('?')[0])
+        const links = [...document.querySelectorAll('a[href*="/playlist/"]')]
+          .map(a => (a.getAttribute('href') || ''))
           .filter(Boolean);
         const uniq = [...new Set(links)];
-        return uniq.slice(0, 12);
+        return uniq.slice(0, 120);
       })())
     `).catch(() => "[]")
 
@@ -327,9 +354,15 @@ export class SpotifyAgent {
     const candidateList = Array.isArray(candidates)
       ? candidates.filter((v): v is string => typeof v === "string")
       : []
-    const first = candidateList.find((h) => /^\/playlist\/[a-zA-Z0-9]+$/.test(h))
-    if (!first) return null
-    return `https://open.spotify.com${first}`
+    const candidateIds = candidateList
+      .map((href) => this.extractPlaylistId(href))
+      .filter((v): v is string => Boolean(v))
+    const uniqueIds = [...new Set(candidateIds)]
+    if (uniqueIds.length === 0) return null
+
+    const known = new Set(knownPlaylistIdsBefore)
+    const createdId = uniqueIds.find((id) => !known.has(id)) ?? uniqueIds[0]
+    return `https://open.spotify.com/playlist/${createdId}`
   }
 
   // ─── Public methods ─────────────────────────────────────────────────────────
@@ -391,6 +424,7 @@ export class SpotifyAgent {
       let url = await this.agentGetUrl(sandbox)
       this.assertNotLogin(url)
       await this.sleep(2000) // Web Player initialization
+      const knownPlaylistIdsBefore = await this.readVisiblePlaylistIds(sandbox).catch(() => [])
 
       // ── Cookie banner ─────────────────────────────────────────────────────
       await this.findAndClick(
@@ -423,7 +457,11 @@ export class SpotifyAgent {
         await this.sleep(700)
       }
 
-      const canonicalUrl = await this.resolvePlaylistUrlAfterCreate(sandbox, url)
+      const canonicalUrl = await this.resolvePlaylistUrlAfterCreate(
+        sandbox,
+        url,
+        knownPlaylistIdsBefore
+      )
       if (!canonicalUrl) throw new Error("Could not navigate to playlist page")
       await this.agentOpen(sandbox, canonicalUrl).catch(() => {})
       console.log("[sandbox] playlist created:", canonicalUrl)
