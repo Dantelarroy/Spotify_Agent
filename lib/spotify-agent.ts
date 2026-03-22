@@ -425,10 +425,18 @@ try {
 
   if (!created) {
     const diag = await collectCreateDiagnostics(page);
+    const controls = Array.isArray(diag?.controlsSample) ? diag.controlsSample : [];
+    const hasLibrarySignals = controls.some((c) => {
+      const joined = (String(c?.text || "") + " " + String(c?.aria || "") + " " + String(c?.testid || "")).toLowerCase();
+      return joined.includes("library") || joined.includes("biblioteca") || joined.includes("playlist") || joined.includes("lista");
+    });
     result.debug = {
       ...result.debug,
       createDiagnostics: diag,
     };
+    if (String(diag?.url || '').includes('/collection/tracks') && !hasLibrarySignals) {
+      throw new Error('SPOTIFY_NOT_CONNECTED: incomplete web session cookies (missing library controls). Reconnect with full Cookie header (sp_dc + sp_key).');
+    }
     throw new Error('Could not click create playlist control');
   }
 

@@ -15,6 +15,35 @@ interface CaptureSession {
 // In-memory store for active capture sessions
 const captureSessions = new Map<string, CaptureSession>()
 
+function parseCookieHeader(raw: string): Array<{ name: string; value: string; domain: string; path: string; httpOnly: boolean; secure: boolean; sameSite: "None" }> {
+  const pairs = raw
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const idx = entry.indexOf("=")
+      if (idx <= 0) return null
+      const name = entry.slice(0, idx).trim()
+      const value = entry.slice(idx + 1).trim()
+      if (!name || !value) return null
+      return { name, value }
+    })
+    .filter((v): v is { name: string; value: string } => Boolean(v))
+
+  const uniq = new Map<string, string>()
+  for (const p of pairs) uniq.set(p.name, p.value)
+
+  return [...uniq.entries()].map(([name, value]) => ({
+    name,
+    value,
+    domain: ".spotify.com",
+    path: "/",
+    httpOnly: true,
+    secure: true,
+    sameSite: "None" as const,
+  }))
+}
+
 // POST: Launch Playwright browser for Spotify login capture
 export async function POST(req: Request) {
   const session = await auth()
@@ -34,6 +63,32 @@ export async function POST(req: Request) {
     body && typeof body === "object" && "spDc" in body
       ? String((body as { spDc?: unknown }).spDc ?? "").trim()
       : ""
+  const cookieHeader =
+    body && typeof body === "object" && "cookieHeader" in body
+      ? String((body as { cookieHeader?: unknown }).cookieHeader ?? "").trim()
+      : ""
+
+  if (cookieHeader) {
+    const parsed = parseCookieHeader(cookieHeader)
+    const hasSpDc = parsed.some((c) => c.name === "sp_dc")
+    const hasSpKey = parsed.some((c) => c.name === "sp_key")
+    if (!hasSpDc) {
+      return NextResponse.json(
+        { error: "El cookie header no contiene sp_dc." },
+        { status: 400 }
+      )
+    }
+    await saveSpotifySession(session.user.id, parsed)
+    return NextResponse.json({
+      connected: true,
+      mode: "manual-header",
+      cookieCount: parsed.length,
+      hasSpKey,
+      warning: hasSpKey
+        ? null
+        : "Falta sp_key. Algunas acciones de biblioteca pueden fallar.",
+    })
+  }
 
   if (spDc) {
     if (spDc.length < 20) {
@@ -54,7 +109,11 @@ export async function POST(req: Request) {
       },
     ]
     await saveSpotifySession(session.user.id, cookies)
-    return NextResponse.json({ connected: true, mode: "manual" })
+    return NextResponse.json({
+      connected: true,
+      mode: "manual",
+      warning: "Se guardó solo sp_dc. Recomendado: pegar cookie header completo con sp_key.",
+    })
   }
 
   // In serverless deploys, interactive Playwright login is not reliable.
