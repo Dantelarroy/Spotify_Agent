@@ -16,10 +16,57 @@ interface CaptureSession {
 const captureSessions = new Map<string, CaptureSession>()
 
 // POST: Launch Playwright browser for Spotify login capture
-export async function POST() {
+export async function POST(req: Request) {
   const session = await auth()
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+  }
+
+  // Manual fallback: accept sp_dc directly from user (works in Vercel production).
+  let body: unknown = null
+  try {
+    body = await req.json()
+  } catch {
+    // body is optional in auto mode
+  }
+
+  const spDc =
+    body && typeof body === "object" && "spDc" in body
+      ? String((body as { spDc?: unknown }).spDc ?? "").trim()
+      : ""
+
+  if (spDc) {
+    if (spDc.length < 20) {
+      return NextResponse.json(
+        { error: "Cookie sp_dc inválida o incompleta." },
+        { status: 400 }
+      )
+    }
+    const cookies = [
+      {
+        name: "sp_dc",
+        value: spDc,
+        domain: ".spotify.com",
+        path: "/",
+        httpOnly: true,
+        secure: true,
+        sameSite: "None" as const,
+      },
+    ]
+    await saveSpotifySession(session.user.id, cookies)
+    return NextResponse.json({ connected: true, mode: "manual" })
+  }
+
+  // In serverless deploys, interactive Playwright login is not reliable.
+  if (process.env.VERCEL === "1") {
+    return NextResponse.json(
+      {
+        error:
+          "Conexión automática no disponible en deploy. Usá la conexión manual pegando tu cookie sp_dc.",
+        code: "MANUAL_REQUIRED",
+      },
+      { status: 501 }
+    )
   }
 
   const sessionId = crypto.randomUUID()
@@ -114,7 +161,14 @@ export async function POST() {
     return NextResponse.json({ sessionId })
   } catch (err) {
     console.error("[connect-spotify] launch failed:", err)
-    return NextResponse.json({ error: "No se pudo abrir el navegador." }, { status: 500 })
+    return NextResponse.json(
+      {
+        error:
+          "No se pudo abrir el navegador. En deploy usá conexión manual con cookie sp_dc.",
+        code: "BROWSER_UNAVAILABLE",
+      },
+      { status: 500 }
+    )
   }
 }
 

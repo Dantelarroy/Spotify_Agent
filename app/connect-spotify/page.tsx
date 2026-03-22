@@ -12,6 +12,8 @@ function ConnectContent() {
 
   const [state, setState] = useState<"idle" | "waiting" | "done" | "error">("idle")
   const [error, setError] = useState<string | null>(urlError)
+  const [manualMode, setManualMode] = useState(false)
+  const [spDc, setSpDc] = useState("")
 
   const handleConnect = async () => {
     setState("waiting")
@@ -21,6 +23,9 @@ function ConnectContent() {
       const res = await fetch("/api/connect-spotify", { method: "POST" })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
+        if (body.code === "MANUAL_REQUIRED" || body.code === "BROWSER_UNAVAILABLE") {
+          setManualMode(true)
+        }
         throw new Error(body.error ?? "No se pudo iniciar la conexión.")
       }
       const { sessionId } = await res.json()
@@ -61,6 +66,31 @@ function ConnectContent() {
     }
   }
 
+  const handleManualConnect = async () => {
+    setError(null)
+    if (!spDc.trim()) {
+      setError("Pegá tu cookie sp_dc para continuar.")
+      return
+    }
+    setState("waiting")
+    try {
+      const res = await fetch("/api/connect-spotify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ spDc: spDc.trim() }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(body.error ?? "No se pudo guardar la sesión.")
+      }
+      setState("done")
+      setTimeout(() => router.replace("/app"), 800)
+    } catch (err: unknown) {
+      setState("error")
+      setError(err instanceof Error ? err.message : "Error inesperado.")
+    }
+  }
+
   return (
     <main className="min-h-screen bg-[#0a0a0a] text-white flex flex-col items-center justify-center p-6">
       <div className="max-w-md w-full text-center space-y-6">
@@ -81,7 +111,7 @@ function ConnectContent() {
           </div>
         )}
 
-        {state === "idle" && (
+        {state === "idle" && !manualMode && (
           <button
             onClick={handleConnect}
             className="flex items-center justify-center gap-3 px-8 py-4 bg-[#1db954] hover:bg-[#1ed760] text-black font-bold rounded-full transition-all w-full"
@@ -91,6 +121,31 @@ function ConnectContent() {
             </svg>
             Conectar con Spotify
           </button>
+        )}
+
+        {(manualMode || state === "error") && (
+          <div className="space-y-3 text-left">
+            <div className="px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-xs text-gray-300 space-y-2">
+              <p className="font-semibold text-sm text-white">Conexión manual (deploy)</p>
+              <p>1) Abrí <code className="text-[#1db954]">open.spotify.com</code> y logueate.</p>
+              <p>2) En DevTools, buscá la cookie <code className="text-[#1db954]">sp_dc</code> para <code className="text-[#1db954]">.spotify.com</code>.</p>
+              <p>3) Copiá el valor y pegalo acá.</p>
+            </div>
+            <textarea
+              value={spDc}
+              onChange={(e) => setSpDc(e.target.value)}
+              rows={4}
+              placeholder="Pegar valor de cookie sp_dc..."
+              className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-[#1db954]/50"
+            />
+            <button
+              onClick={handleManualConnect}
+              disabled={!spDc.trim() || state === "waiting"}
+              className="w-full px-6 py-3 bg-[#1db954] hover:bg-[#1ed760] disabled:opacity-40 disabled:cursor-not-allowed text-black font-bold rounded-full transition-all"
+            >
+              Guardar conexión manual
+            </button>
+          </div>
         )}
 
         {state === "waiting" && (
@@ -114,7 +169,7 @@ function ConnectContent() {
           </div>
         )}
 
-        {state === "error" && (
+        {state === "error" && !manualMode && (
           <button
             onClick={() => { setState("idle"); setError(null) }}
             className="flex items-center justify-center gap-3 px-8 py-4 bg-[#1db954] hover:bg-[#1ed760] text-black font-bold rounded-full transition-all w-full"
