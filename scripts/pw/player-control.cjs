@@ -5,6 +5,15 @@ function normalizeText(s) {
   return String(s || '').toLowerCase().trim();
 }
 
+function hasRequiredCookies(cookies) {
+  const names = new Set(
+    (Array.isArray(cookies) ? cookies : [])
+      .map((c) => String(c?.name || ''))
+      .filter(Boolean)
+  );
+  return names.has('sp_dc') && names.has('sp_key');
+}
+
 async function clickFirst(page, selectors, timeout = 1600) {
   for (const selector of selectors) {
     const locator = page.locator(selector).first();
@@ -33,6 +42,16 @@ async function ensureSearchTracksView(page, query) {
     '[role="tab"]:has-text("Musicas")',
   ], 1200);
   await page.waitForTimeout(350);
+  if (page.url().includes('accounts.spotify.com')) {
+    throw new Error('SPOTIFY_NOT_CONNECTED: redirected to accounts.spotify.com');
+  }
+  const hasLoginWall = await page.evaluate(() => {
+    const txt = (document.body?.innerText || '').toLowerCase();
+    return txt.includes('log in') || txt.includes('inicia sesión') || txt.includes('iniciar sesión');
+  }).catch(() => false);
+  if (hasLoginWall) {
+    throw new Error('SPOTIFY_NOT_CONNECTED: search page is behind login wall');
+  }
   await page.waitForSelector('a[href*="/track/"], [data-testid="tracklist-row"]', { timeout: 9000 }).catch(() => null);
 }
 
@@ -70,6 +89,9 @@ let browser;
 let page;
 ;(async () => {
   try {
+    if (!hasRequiredCookies(input.cookies)) {
+      throw new Error('SPOTIFY_NOT_CONNECTED: incomplete cookies (sp_dc + sp_key required)');
+    }
     let chromium;
     try {
       ({ chromium } = require('playwright'));

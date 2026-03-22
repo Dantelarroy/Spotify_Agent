@@ -78,42 +78,27 @@ export async function POST(req: Request) {
         { status: 400 }
       )
     }
+    if (!hasSpKey) {
+      return NextResponse.json(
+        { error: "El cookie header no contiene sp_key. Copiá el header completo (sp_dc + sp_key)." },
+        { status: 400 }
+      )
+    }
     await saveSpotifySession(session.user.id, parsed)
     return NextResponse.json({
       connected: true,
       mode: "manual-header",
       cookieCount: parsed.length,
-      hasSpKey,
-      warning: hasSpKey
-        ? null
-        : "Falta sp_key. Algunas acciones de biblioteca pueden fallar.",
+      hasSpKey: true,
+      warning: null,
     })
   }
 
   if (spDc) {
-    if (spDc.length < 20) {
-      return NextResponse.json(
-        { error: "Cookie sp_dc inválida o incompleta." },
-        { status: 400 }
-      )
-    }
-    const cookies = [
-      {
-        name: "sp_dc",
-        value: spDc,
-        domain: ".spotify.com",
-        path: "/",
-        httpOnly: true,
-        secure: true,
-        sameSite: "None" as const,
-      },
-    ]
-    await saveSpotifySession(session.user.id, cookies)
-    return NextResponse.json({
-      connected: true,
-      mode: "manual",
-      warning: "Se guardó solo sp_dc. Recomendado: pegar cookie header completo con sp_key.",
-    })
+    return NextResponse.json(
+      { error: "Solo sp_dc ya no es suficiente. Pegá el cookie header completo (sp_dc + sp_key)." },
+      { status: 400 }
+    )
   }
 
   // In serverless deploys, interactive Playwright login is not reliable.

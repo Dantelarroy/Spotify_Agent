@@ -13,7 +13,6 @@ function ConnectContent() {
   const [state, setState] = useState<"idle" | "waiting" | "done" | "error">("idle")
   const [error, setError] = useState<string | null>(urlError)
   const [manualMode, setManualMode] = useState(false)
-  const [spDc, setSpDc] = useState("")
   const [cookieHeader, setCookieHeader] = useState("")
 
   const handleConnect = async () => {
@@ -69,15 +68,13 @@ function ConnectContent() {
 
   const handleManualConnect = async () => {
     setError(null)
-    if (!spDc.trim() && !cookieHeader.trim()) {
-      setError("Pegá sp_dc o (recomendado) el cookie header completo.")
+    if (!cookieHeader.trim()) {
+      setError("Pegá el cookie header completo (sp_dc + sp_key).")
       return
     }
     setState("waiting")
     try {
-      const payload = cookieHeader.trim()
-        ? { cookieHeader: cookieHeader.trim() }
-        : { spDc: spDc.trim() }
+      const payload = { cookieHeader: cookieHeader.trim() }
       const res = await fetch("/api/connect-spotify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -133,7 +130,7 @@ function ConnectContent() {
               <p className="font-semibold text-sm text-white">Conexión manual (deploy)</p>
               <p>1) Abrí <code className="text-[#1db954]">open.spotify.com</code> y logueate.</p>
               <p>2) Recomendado: en DevTools, copiá el <code className="text-[#1db954]">Cookie header</code> completo de una request a Spotify Web (incluye <code className="text-[#1db954]">sp_dc</code> + <code className="text-[#1db954]">sp_key</code>).</p>
-              <p>3) Pegalo abajo. Si no, podés pegar solo <code className="text-[#1db954]">sp_dc</code> (menos estable).</p>
+              <p>3) Pegalo abajo tal cual (con ambos cookies).</p>
             </div>
             <textarea
               value={cookieHeader}
@@ -142,16 +139,9 @@ function ConnectContent() {
               placeholder="Cookie: sp_dc=...; sp_key=...; ..."
               className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-[#1db954]/50"
             />
-            <textarea
-              value={spDc}
-              onChange={(e) => setSpDc(e.target.value)}
-              rows={3}
-              placeholder="Alternativa: pegar solo valor de cookie sp_dc..."
-              className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-[#1db954]/50"
-            />
             <button
               onClick={handleManualConnect}
-              disabled={(!spDc.trim() && !cookieHeader.trim()) || state === "waiting"}
+              disabled={!cookieHeader.trim() || state === "waiting"}
               className="w-full px-6 py-3 bg-[#1db954] hover:bg-[#1ed760] disabled:opacity-40 disabled:cursor-not-allowed text-black font-bold rounded-full transition-all"
             >
               Guardar conexión manual
