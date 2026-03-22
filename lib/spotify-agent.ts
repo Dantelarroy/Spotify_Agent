@@ -67,9 +67,8 @@ ws.addEventListener('error', ev => { console.error('CDP error', ev.message); pro
 setTimeout(() => { if (!done) { console.error('timeout'); process.exit(1); } }, 8000);
 `.trim()
 
-const PLAYWRIGHT_CREATE_PLAYLIST_MJS = `
-import { chromium } from 'playwright';
-import { readFileSync, writeFileSync } from 'node:fs';
+const PLAYWRIGHT_CREATE_PLAYLIST_CJS = `
+const { readFileSync, writeFileSync } = require('node:fs');
 
 function extractPlaylistIdsFromHrefs(hrefs) {
   const ids = hrefs
@@ -103,7 +102,9 @@ const result = {
 
 let browser;
 let page;
+;(async () => {
 try {
+  const { chromium } = require('playwright');
   browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
@@ -294,9 +295,21 @@ try {
   } catch {}
 } finally {
   if (browser) await browser.close().catch(() => {});
+  try { writeFileSync('/tmp/spotify-pw-result.json', JSON.stringify(result), 'utf8'); } catch {}
+  try { console.log('SPOTIFY_PW_RESULT=' + JSON.stringify(result)); } catch {}
 }
-
-console.log('SPOTIFY_PW_RESULT=' + JSON.stringify(result));
+})().catch((err) => {
+  const fatal = {
+    ok: false,
+    message: err instanceof Error ? err.message : String(err),
+    url: null,
+    trackCount: 0,
+    phase: 'bootstrap',
+    debug: {},
+  };
+  try { writeFileSync('/tmp/spotify-pw-result.json', JSON.stringify(fatal), 'utf8'); } catch {}
+  try { console.log('SPOTIFY_PW_RESULT=' + JSON.stringify(fatal)); } catch {}
+});
 `.trim()
 
 // Dependencias del sistema para Chromium en Fedora (runtime Vercel Sandbox)
@@ -465,14 +478,14 @@ export class SpotifyAgent {
     }
     await sandbox.writeFiles([
       { path: "/tmp/spotify-playlist-input.json", content: Buffer.from(JSON.stringify(input)) },
-      { path: "/tmp/pw-create-playlist.mjs", content: Buffer.from(PLAYWRIGHT_CREATE_PLAYLIST_MJS) },
+      { path: "/tmp/pw-create-playlist.cjs", content: Buffer.from(PLAYWRIGHT_CREATE_PLAYLIST_CJS) },
     ])
 
     const run = await this.runSandboxCommand(
       sandbox,
       "playwright-create-playlist",
       "sh",
-      ["-lc", "export NODE_PATH=$(npm root -g); node /tmp/pw-create-playlist.mjs"],
+      ["-lc", "export NODE_PATH=$(npm root -g); node /tmp/pw-create-playlist.cjs || true"],
       0
     )
     const stdout = await run.stdout()
@@ -482,20 +495,41 @@ export class SpotifyAgent {
     }
 
     const marker = "SPOTIFY_PW_RESULT="
-    const line = stdout
+    const mergedOutput = [stdout, stderr].join("\n")
+    const line = mergedOutput
       .split("\n")
       .map((l) => l.trim())
       .find((l) => l.startsWith(marker))
-    if (!line) {
-      throw new Error(`Playwright result not found in sandbox output: ${stdout.slice(-400)}`)
-    }
-    const parsed = JSON.parse(line.slice(marker.length)) as {
+    let parsed: {
       ok: boolean
       message?: string
       url?: string | null
       trackCount?: number
       phase?: string
       debug?: Record<string, unknown>
+    } | null = null
+
+    if (line) {
+      parsed = JSON.parse(line.slice(marker.length))
+    } else {
+      const fallback = await this.runSandboxCommand(
+        sandbox,
+        "read-playwright-result-file",
+        "sh",
+        ["-lc", "cat /tmp/spotify-pw-result.json 2>/dev/null || true"],
+        0
+      )
+      const fallbackRaw = (await fallback.stdout()).trim()
+      if (fallbackRaw) {
+        try {
+          parsed = JSON.parse(fallbackRaw)
+        } catch {
+          parsed = null
+        }
+      }
+    }
+    if (!parsed) {
+      throw new Error(`Playwright result not found in sandbox output: ${mergedOutput.slice(-600)}`)
     }
 
     if (!parsed.ok || !parsed.url) {
