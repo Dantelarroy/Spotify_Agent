@@ -5,9 +5,16 @@ import { prisma } from "./db"
 import type { JWT } from "next-auth/jwt"
 
 const providers = [
+  // Explicit token/userinfo endpoints bypass OIDC discovery.
+  // oauth4webapi checks "iss" in auth responses when Google's discovery doc says
+  // authorization_response_iss_parameter_supported=true — but Google doesn't send it.
+  // Bypassing discovery avoids that check entirely.
   GoogleProvider({
     clientId: process.env.AUTH_GOOGLE_ID!,
     clientSecret: process.env.AUTH_GOOGLE_SECRET!,
+    token: "https://oauth2.googleapis.com/token",
+    userinfo: "https://openidconnect.googleapis.com/v1/userinfo",
+    checks: ["pkce"],
   }),
 ]
 
