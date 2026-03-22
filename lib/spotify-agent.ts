@@ -108,9 +108,9 @@ try {
   try {
     ({ chromium } = require('playwright'));
   } catch (err) {
-    const globalRoot = process.env.PLAYWRIGHT_GLOBAL_ROOT || '';
-    if (!globalRoot) throw err;
-    ({ chromium } = require(globalRoot + '/playwright'));
+    const nodeModulesRoot = process.env.PLAYWRIGHT_NODE_MODULES || '';
+    if (!nodeModulesRoot) throw err;
+    ({ chromium } = require(nodeModulesRoot + '/playwright'));
   }
   browser = await chromium.launch({
     headless: true,
@@ -312,7 +312,9 @@ try {
     url: null,
     trackCount: 0,
     phase: 'bootstrap',
-    debug: {},
+    debug: {
+      playwrightNodeModules: process.env.PLAYWRIGHT_NODE_MODULES || '',
+    },
   };
   try { writeFileSync('/tmp/spotify-pw-result.json', JSON.stringify(fatal), 'utf8'); } catch {}
   try { console.log('SPOTIFY_PW_RESULT=' + JSON.stringify(fatal)); } catch {}
@@ -447,24 +449,27 @@ export class SpotifyAgent {
       sandbox,
       "playwright-probe",
       "sh",
-      ["-lc", "export NODE_PATH=$(npm root -g); node -e \"require('playwright'); console.log('ok')\""],
+      ["-lc", "node -e \"require('/tmp/pw-runtime/node_modules/playwright'); console.log('ok')\""],
       0
     ).catch(() => null)
     if (probe) return
 
-    console.log("[sandbox] installing playwright (one-time per sandbox)")
+    console.log("[sandbox] installing playwright in /tmp/pw-runtime (one-time per sandbox)")
     await this.runSandboxCommand(
       sandbox,
       "install-playwright-package",
-      "npm",
-      ["install", "-g", "playwright", "--unsafe-perm=true"],
+      "sh",
+      [
+        "-lc",
+        "mkdir -p /tmp/pw-runtime && cd /tmp/pw-runtime && [ -f package.json ] || npm init -y >/dev/null 2>&1 && npm install playwright --no-audit --no-fund",
+      ],
       1
     )
     await this.runSandboxCommand(
       sandbox,
       "install-playwright-browser",
-      "npx",
-      ["playwright", "install", "chromium"],
+      "sh",
+      ["-lc", "cd /tmp/pw-runtime && npx playwright install chromium"],
       1
     )
   }
@@ -494,7 +499,7 @@ export class SpotifyAgent {
       "sh",
       [
         "-lc",
-        "export PLAYWRIGHT_GLOBAL_ROOT=$(npm root -g); node /tmp/pw-create-playlist.cjs || true",
+        "export PLAYWRIGHT_NODE_MODULES=/tmp/pw-runtime/node_modules; node /tmp/pw-create-playlist.cjs || true",
       ],
       0
     )
