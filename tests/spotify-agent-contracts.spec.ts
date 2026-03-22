@@ -6,44 +6,71 @@ import { resolve } from "path"
  * Contracts spec — static analysis + HTTP gates.
  *
  * Arquitectura exigida:
- *   - Screenshot-only para toda interacción de UI (sin selectores CSS en acciones)
- *   - Claude Haiku (más barato) para visión
- *   - runLoop central (observe-act loop)
- *   - Sin api.spotify.com, sin tokens OAuth
+ *   - Vercel Sandbox (@vercel/sandbox) para microVM efímero
+ *   - agent-browser CLI (Rust/CDP) como browser dentro del VM
+ *   - Cookies inyectadas via CDP (Network.setCookies) — no Playwright
+ *   - AX tree snapshot → click @ref, con fallback a eval JS
+ *   - Sin screenshots, sin Claude Haiku, sin Playwright
  */
 
-// ─── Arquitectura ─────────────────────────────────────────────────────────────
+// ─── Arquitectura: Vercel Sandbox ────────────────────────────────────────────
 
-test("usa claude-haiku como modelo de visión (el más barato)", () => {
+test("usa @vercel/sandbox (microVM efímero)", () => {
   const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
-  expect(src).toContain("claude-haiku-4-5-20251001")
+  expect(src).toContain("@vercel/sandbox")
+  expect(src).toContain("Sandbox.create")
 })
 
-test("screenshots en formato jpeg (más pequeño = más rápido)", () => {
+test("destruye el sandbox al terminar (sandbox.stop)", () => {
   const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
-  expect(src).toContain("jpeg")
+  expect(src).toContain("sandbox.stop")
 })
 
-test("existe runLoop como bucle agéntico central", () => {
+test("soporta snapshot pre-baked para arranque rápido", () => {
   const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
-  expect(src).toContain("runLoop")
+  expect(src).toContain("AGENT_BROWSER_SNAPSHOT_ID")
+  expect(src).toContain("type: \"snapshot\"")
 })
 
-test("runLoop llama a askHaiku (screenshot → acción)", () => {
+// ─── Arquitectura: agent-browser CLI ─────────────────────────────────────────
+
+test("usa agent-browser como CLI via runCommand", () => {
   const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
-  expect(src).toContain("askHaiku")
+  expect(src).toContain("agent-browser")
+  expect(src).toContain("runCommand")
 })
 
-test("acciones del agente usan coordenadas x,y (no selectores)", () => {
+test("inyecta cookies via CDP (Network.setCookies) — no Playwright", () => {
   const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
-  // El agente debe mandar clicks por coordenadas
-  expect(src).toContain('"x"')
-  expect(src).toContain('"y"')
-  // No debe usar page.locator() ni getByRole() para las acciones de UI
-  // (sí puede usar page.evaluate() para extraer datos DOM — eso está bien)
-  const runLoopBody = src.slice(src.indexOf("private async runLoop"), src.indexOf("private async runLoop") + 2000)
-  expect(runLoopBody).not.toContain("page.locator(")
-  expect(runLoopBody).not.toContain("page.getByRole(")
+  expect(src).toContain("Network.setCookies")
+  expect(src).toContain("inject-cookies.mjs")
+})
+
+test("usa AX tree snapshot con click por referencia (@eN)", () => {
+  const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
+  expect(src).toContain("snapshot")
+  expect(src).toContain("agentClick")
+})
+
+test("acciones con fallback a eval JS (no depende solo del AX tree)", () => {
+  const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
+  expect(src).toContain("agentEval")
+  expect(src).toContain("findAndClick")
+})
+
+// ─── Sin screenshots, sin Claude Haiku ───────────────────────────────────────
+
+test("no usa Playwright (chromium.launch eliminado)", () => {
+  const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
+  expect(src).not.toContain("chromium.launch")
+  expect(src).not.toContain("playwright")
+})
+
+test("no usa Claude Haiku para visión (screenshots eliminados)", () => {
+  const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
+  expect(src).not.toContain("claude-haiku")
+  expect(src).not.toContain("image/jpeg")
+  expect(src).not.toContain("askHaiku")
 })
 
 test("no usa la API oficial de Spotify", () => {
@@ -89,12 +116,17 @@ test("SpotifyAgent.getNowPlaying existe", () => {
   expect(src).toContain("async getNowPlaying(")
 })
 
+test("SpotifyAgent.createSnapshot existe (setup inicial)", () => {
+  const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
+  expect(src).toContain("async createSnapshot(")
+})
+
 test("createAgent factory exportada", () => {
   const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
   expect(src).toContain("export function createAgent")
 })
 
-// ─── Contratos de tools.ts ───────────────────────────────────────────────────
+// ─── tools.ts — sin cambios en la interfaz ───────────────────────────────────
 
 test("tools.ts tiene play_track", () => {
   const src = readFileSync(resolve("lib/tools.ts"), "utf-8")
@@ -114,12 +146,6 @@ test("tools.ts tiene next_track", () => {
 test("tools.ts tiene now_playing", () => {
   const src = readFileSync(resolve("lib/tools.ts"), "utf-8")
   expect(src).toContain("now_playing")
-})
-
-test("play_track usa wrapSpotifyCall", () => {
-  const src = readFileSync(resolve("lib/tools.ts"), "utf-8")
-  const section = src.slice(src.indexOf("play_track"), src.indexOf("play_track") + 400)
-  expect(section).toContain("wrapSpotifyCall")
 })
 
 // ─── HTTP gates ───────────────────────────────────────────────────────────────

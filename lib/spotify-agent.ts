@@ -1,21 +1,26 @@
 /**
- * SpotifyAgent — browser automation via Playwright + Claude Haiku vision.
+ * SpotifyAgent — Vercel Sandbox + agent-browser (Rust/CDP).
  *
- * Arquitectura: screenshot-only observe-act loop.
- *   1. Tomar screenshot JPEG del browser (1280×800)
- *   2. Enviar a Claude Haiku (modelo de visión más barato)
- *   3. Haiku devuelve UNA acción con coordenadas (x, y) o texto
- *   4. Playwright ejecuta la acción
- *   5. Repetir hasta que la condición de éxito se cumpla
+ * Arquitectura:
+ * 1. @vercel/sandbox crea un microVM Firecracker efímero
+ * 2. agent-browser (CLI Rust) controla Chrome via CDP dentro del VM
+ * 3. Las cookies de sesión del usuario se inyectan via CDP (Network.setCookies)
+ * 4. Acciones: AX tree snapshot → click @ref, con fallback a eval JS
+ * 5. Al terminar, el VM se destruye — sin estado residual
  *
- * Sin selectores CSS hardcodeados para acciones de UI.
- * Funciona aunque Spotify cambie su DOM o diseño.
+ * Sin screenshots, sin Claude Haiku vision, sin Playwright.
+ * NO usa la API oficial de Spotify.
  *
- * NO usa la API oficial de Spotify. Todo pasa por el browser con cookies (sp_dc).
+ * Costo objetivo: ~$0.0008 por 15s de CPU (Vercel Fluid Compute).
+ * Latencia objetivo: ~15s para playlists simples (con snapshot pre-baked).
+ *
+ * Setup inicial (una sola vez):
+ *   const agent = createAgent(cookies)
+ *   const snapshotId = await agent.createSnapshot()
+ *   // Guardar snapshotId en AGENT_BROWSER_SNAPSHOT_ID
  */
 
-import { chromium, type Browser, type Page } from "playwright"
-import Anthropic from "@anthropic-ai/sdk"
+import { Sandbox } from "@vercel/sandbox"
 
 export interface SpotifyAgentCookie {
   name: string
@@ -28,41 +33,55 @@ export interface SpotifyAgentCookie {
   sameSite?: "Strict" | "Lax" | "None"
 }
 
-// Modelo más barato con visión — $0.80/MTok input, $4/MTok output
-const VISION_MODEL = "claude-haiku-4-5-20251001"
+// ─── CDP cookie injection script ──────────────────────────────────────────────
+// Corre dentro del microVM (Node 24 — WebSocket built-in, top-level await en .mjs)
+const INJECT_COOKIES_MJS = `
+import http from 'node:http';
+import { readFileSync } from 'node:fs';
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+const cookies = JSON.parse(readFileSync('/root/cookies.json', 'utf8'));
 
-type AgentAction =
-  | { action: "click"; x: number; y: number; reason: string }
-  | { action: "type"; text: string; reason: string }
-  | { action: "key"; key: string; reason: string }
-  | { action: "scroll"; dir: "up" | "down"; reason: string }
-  | { action: "done"; result: string; reason: string }
-  | { action: "failed"; reason: string }
+const targets = await new Promise((ok, fail) => {
+  http.get('http://localhost:9222/json', (res) => {
+    let d = ''; res.on('data', c => d += c);
+    res.on('end', () => ok(JSON.parse(d))); res.on('error', fail);
+  });
+});
 
-function buildPrompt(goal: string, step: number, maxSteps: number): string {
-  return `You control Spotify Web Player running in a headless browser at 1280×800 pixels.
+const page = targets.find(t => t.type === 'page') ?? targets[0];
+if (!page?.webSocketDebuggerUrl) { console.error('no CDP target'); process.exit(1); }
 
-GOAL: ${goal}
-STEP: ${step + 1} of ${maxSteps}
+const ws = new WebSocket(page.webSocketDebuggerUrl);
+let done = false;
 
-Look at the screenshot carefully and choose exactly ONE action to take right now.
-Reply with ONLY a single JSON object — no markdown, no explanation.
+ws.addEventListener('open', () =>
+  ws.send(JSON.stringify({ id: 1, method: 'Network.enable' }))
+);
+ws.addEventListener('message', ev => {
+  const m = JSON.parse(ev.data);
+  if (m.id === 1) {
+    ws.send(JSON.stringify({ id: 2, method: 'Network.setCookies', params: { cookies } }));
+  } else if (m.id === 2) {
+    done = true; ws.close(); process.exit(0);
+  }
+});
+ws.addEventListener('error', ev => { console.error('CDP error', ev.message); process.exit(1); });
+setTimeout(() => { if (!done) { console.error('timeout'); process.exit(1); } }, 8000);
+`.trim()
 
-{"action":"click","x":NNN,"y":NNN,"reason":"why you click here"}
-{"action":"type","text":"the text to type","reason":"..."}
-{"action":"key","key":"Enter","reason":"..."}
-{"action":"scroll","dir":"down","reason":"..."}
-{"action":"done","result":"description of what was achieved","reason":"..."}
-{"action":"failed","reason":"SPOTIFY_NOT_CONNECTED"}
+// Dependencias del sistema para Chromium en Fedora (runtime Vercel Sandbox)
+const CHROMIUM_DEPS = [
+  "nss", "nspr", "libxkbcommon", "atk", "at-spi2-atk", "at-spi2-core",
+  "libXcomposite", "libXdamage", "libXrandr", "libXfixes", "libXcursor",
+  "libXi", "libXtst", "libXScrnSaver", "libXext", "mesa-libgbm", "libdrm",
+  "mesa-libGL", "mesa-libEGL", "cups-libs", "alsa-lib", "pango", "cairo",
+  "gtk3", "dbus-libs",
+]
 
-Rules:
-- PRIORITY 1: If a cookie/GDPR consent banner is blocking the UI, click Accept or Reject first.
-- Click (x,y) must be the center of the visible element you want to interact with.
-- To type into a field: first click the field (step N), then type the text (step N+1).
-- If Spotify shows the login page at accounts.spotify.com → {"action":"failed","reason":"SPOTIFY_NOT_CONNECTED"}.
-- Only return "done" when the GOAL is fully achieved.`
+interface AXElement {
+  ref: string   // e.g. "e5"
+  role: string  // e.g. "button"
+  name: string  // e.g. "Create playlist"
 }
 
 export class SpotifyAgent {
@@ -72,28 +91,131 @@ export class SpotifyAgent {
     this.cookies = cookies
   }
 
-  private async withBrowser<T>(fn: (page: Page) => Promise<T>): Promise<T> {
-    let browser: Browser | null = null
+  // ─── Sandbox lifecycle ──────────────────────────────────────────────────────
+
+  private async withSandbox<T>(
+    fn: (sandbox: Sandbox) => Promise<T>,
+    timeoutMs = 120_000
+  ): Promise<T> {
+    const snapshotId = process.env.AGENT_BROWSER_SNAPSHOT_ID
+    let sandbox: Sandbox
+
+    if (snapshotId) {
+      // Fast path: snapshot pre-baked → arranque ~1s
+      sandbox = await Sandbox.create({
+        source: { type: "snapshot", snapshotId },
+        timeout: timeoutMs,
+      })
+      console.log("[sandbox] started from snapshot")
+    } else {
+      // Cold start: instala chromium + agent-browser (~30s)
+      sandbox = await this.bootstrapFreshSandbox(timeoutMs)
+    }
+
     try {
-      browser = await chromium.launch({
-        headless: true,
-        args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      })
-      const ctx = await browser.newContext({
-        userAgent:
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        locale: "en-US",
-        viewport: { width: 1280, height: 800 },
-      })
-      await ctx.addCookies(this.cookies)
-      const page = await ctx.newPage()
-      return await fn(page)
+      return await fn(sandbox)
     } finally {
-      await browser?.close().catch(() => {})
+      await sandbox.stop().catch(() => {})
     }
   }
 
-  private assertNotLoginPage(url: string): void {
+  private async bootstrapFreshSandbox(timeoutMs: number): Promise<Sandbox> {
+    console.log("[sandbox] cold start — bootstrapping (~30s first time)")
+    const sb = await Sandbox.create({ runtime: "node24", timeout: timeoutMs })
+    await sb.runCommand("sh", ["-c",
+      `sudo dnf install -y --skip-broken ${CHROMIUM_DEPS.join(" ")} 2>&1 | tail -3`,
+    ])
+    await sb.runCommand("npm", ["install", "-g", "agent-browser"])
+    await sb.runCommand("npx", ["agent-browser", "install"])
+    console.log("[sandbox] bootstrap done")
+    return sb
+  }
+
+  // ─── Cookie injection via CDP ───────────────────────────────────────────────
+
+  private async injectCookies(sandbox: Sandbox): Promise<void> {
+    await sandbox.writeFiles([
+      { path: "/root/cookies.json", content: JSON.stringify(this.cookies) },
+      { path: "/root/inject-cookies.mjs", content: INJECT_COOKIES_MJS },
+    ])
+    // Primera apertura — arranca Chrome con CDP en puerto 9222
+    await sandbox.runCommand("agent-browser", ["open", "about:blank"])
+    // Inyectar cookies httpOnly via CDP antes de navegar a Spotify
+    const result = await sandbox.runCommand("node", ["/root/inject-cookies.mjs"])
+    const stderr = await result.stderr()
+    if (stderr) console.log("[sandbox] inject stderr:", stderr.slice(0, 200))
+    console.log("[sandbox] session cookies injected via CDP")
+  }
+
+  // ─── agent-browser command helpers ─────────────────────────────────────────
+
+  private async agentOpen(sandbox: Sandbox, url: string): Promise<void> {
+    await sandbox.runCommand("agent-browser", ["open", url])
+    // Esperar que el DOM esté disponible
+    await sandbox.runCommand("agent-browser", ["wait", "body"]).catch(() => {})
+  }
+
+  private async agentGetUrl(sandbox: Sandbox): Promise<string> {
+    const r = await sandbox.runCommand("agent-browser", ["get", "url", "--json"])
+    try { return JSON.parse(await r.stdout())?.data?.url ?? "" } catch { return "" }
+  }
+
+  private async agentSnapshot(sandbox: Sandbox): Promise<AXElement[]> {
+    const r = await sandbox.runCommand("agent-browser", ["snapshot", "-i"])
+    return this.parseSnapshot(await r.stdout())
+  }
+
+  private parseSnapshot(raw: string): AXElement[] {
+    const results: AXElement[] = []
+    for (const line of raw.split("\n")) {
+      // Formato: '  button "Create playlist" [@e5]'
+      const m = line.match(/(\w+)\s+"([^"]+)"\s+\[@(e\d+)\]/)
+      if (m) results.push({ role: m[1], name: m[2], ref: m[3] })
+    }
+    return results
+  }
+
+  private async agentClick(sandbox: Sandbox, ref: string): Promise<void> {
+    await sandbox.runCommand("agent-browser", ["click", `@${ref}`])
+    await this.sleep(400)
+  }
+
+  private async agentEval(sandbox: Sandbox, js: string): Promise<string> {
+    const r = await sandbox.runCommand("agent-browser", ["eval", js])
+    return (await r.stdout()).trim()
+  }
+
+  /**
+   * Busca en el AX tree un elemento por label y lo clickea.
+   * Si no está en el AX tree (Spotify a veces falla ARIA), usa eval JS como fallback.
+   */
+  private async findAndClick(
+    sandbox: Sandbox,
+    labels: string[],
+    fallbackJs: string
+  ): Promise<boolean> {
+    try {
+      const elements = await this.agentSnapshot(sandbox)
+      for (const label of labels) {
+        const el = elements.find(e =>
+          e.name.toLowerCase().includes(label.toLowerCase())
+        )
+        if (el) {
+          await this.agentClick(sandbox, el.ref)
+          console.log(`[sandbox] AX click: "${el.name}" [@${el.ref}]`)
+          return true
+        }
+      }
+    } catch { /* si snapshot falla, caemos al eval */ }
+
+    // Fallback CDP eval
+    const result = await this.agentEval(sandbox, fallbackJs)
+    const clicked = result !== "null" && result !== "false" && result !== "undefined" && result !== ""
+    if (clicked) console.log(`[sandbox] eval click (AX fallback)`)
+    return clicked
+  }
+
+  private assertNotLogin(url: string): void {
     if (url.includes("accounts.spotify.com")) {
       throw new Error(
         "SPOTIFY_NOT_CONNECTED: Spotify redirected to login. Session expired — please reconnect."
@@ -101,418 +223,340 @@ export class SpotifyAgent {
     }
   }
 
-  /** Toma un screenshot JPEG comprimido y lo devuelve en base64. */
-  private async screenshot(page: Page, label?: string): Promise<string> {
-    const buf = await page.screenshot({ type: "jpeg", quality: 80 })
-    if (label) {
-      await page.screenshot({ path: `/tmp/spotify-${label}.jpg` }).catch(() => {})
-    }
-    return buf.toString("base64")
+  private sleep(ms: number): Promise<void> {
+    return new Promise(r => setTimeout(r, ms))
   }
 
-  /** Envía el screenshot a Claude Haiku y parsea la acción JSON resultante. */
-  private async askHaiku(
-    image: string,
-    goal: string,
-    step: number,
-    maxSteps: number
-  ): Promise<AgentAction> {
-    const response = await anthropic.messages.create({
-      model: VISION_MODEL,
-      max_tokens: 200,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "image",
-              source: { type: "base64", media_type: "image/jpeg", data: image },
-            },
-            {
-              type: "text",
-              text: buildPrompt(goal, step, maxSteps),
-            },
-          ],
-        },
-      ],
-    })
-
-    const text =
-      response.content[0].type === "text" ? response.content[0].text.trim() : ""
-    const match = text.match(/\{[\s\S]*?\}/)
-
-    if (!match) {
-      console.log(`[agent] step ${step}: no JSON from Haiku — "${text.slice(0, 100)}"`)
-      return { action: "failed", reason: "Haiku returned no valid JSON" }
-    }
-
-    try {
-      return JSON.parse(match[0]) as AgentAction
-    } catch {
-      return { action: "failed", reason: "JSON parse error" }
-    }
-  }
-
-  /** Ejecuta una acción de Playwright a partir de la decisión de Haiku. */
-  private async executeAction(page: Page, action: AgentAction): Promise<void> {
-    if (action.action === "click") {
-      await page.mouse.click(action.x, action.y)
-    } else if (action.action === "type") {
-      await page.keyboard.type(action.text, { delay: 40 })
-    } else if (action.action === "key") {
-      await page.keyboard.press(action.key)
-    } else if (action.action === "scroll") {
-      await page.mouse.wheel(0, action.dir === "down" ? 300 : -300)
-    }
-  }
+  // ─── Public methods ─────────────────────────────────────────────────────────
 
   /**
-   * Bucle agéntico central: screenshot → Haiku decide → ejecuta → verifica.
-   *
-   * successCheck: función DOM barata que devuelve string si el goal se cumplió, null si no.
-   * Haiku también puede declarar "done" por sí mismo al ver el resultado en pantalla.
-   */
-  private async runLoop(
-    page: Page,
-    goal: string,
-    successCheck: (page: Page) => Promise<string | null>,
-    maxSteps = 12
-  ): Promise<string> {
-    for (let step = 0; step < maxSteps; step++) {
-      // Verificar URL primero (más barato que screenshot)
-      this.assertNotLoginPage(page.url())
-
-      // Verificar condición de éxito via DOM (sin imagen, muy barato)
-      const domResult = await successCheck(page)
-      if (domResult !== null) {
-        console.log(`[agent] ✓ dom-check at step ${step}: ${domResult}`)
-        return domResult
-      }
-
-      // Screenshot + Haiku
-      const img = await this.screenshot(page, `step-${step}`)
-      const action = await this.askHaiku(img, goal, step, maxSteps)
-
-      const coords =
-        action.action === "click"
-          ? ` (${action.x},${action.y})`
-          : action.action === "type"
-          ? ` "${action.text}"`
-          : ""
-      console.log(`[agent] step ${step}: ${action.action}${coords} — ${action.reason}`)
-
-      if (action.action === "done") return action.result
-
-      if (action.action === "failed") {
-        const msg = action.reason
-        throw new Error(
-          msg.includes("SPOTIFY_NOT_CONNECTED")
-            ? msg
-            : `Agent failed: ${msg}`
-        )
-      }
-
-      await this.executeAction(page, action)
-      await page.waitForTimeout(600) // dejar que la UI reaccione
-    }
-
-    throw new Error(`Agent loop exhausted after ${maxSteps} steps for goal: ${goal.slice(0, 60)}`)
-  }
-
-  // ─── Métodos públicos ──────────────────────────────────────────────────────
-
-  /**
-   * Busca tracks — extracción DOM pura, sin visión.
-   * No necesita IA porque los datos están en atributos href estructurados.
+   * Busca tracks — extracción DOM pura via eval, sin AI.
    */
   async searchTracks(
     query: string,
     limit = 10
   ): Promise<Array<{ name: string; artist: string; uri: string }>> {
-    return this.withBrowser(async (page) => {
-      await page.goto(
-        `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`,
-        { waitUntil: "domcontentloaded", timeout: 20000 }
+    return this.withSandbox(async (sandbox) => {
+      await this.injectCookies(sandbox)
+      await this.agentOpen(
+        sandbox,
+        `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`
       )
-      this.assertNotLoginPage(page.url())
-      await page.waitForSelector('a[href^="/track/"]', { timeout: 15000 }).catch(() => {})
+      this.assertNotLogin(await this.agentGetUrl(sandbox))
 
-      const tracks = await page.evaluate((lim: number) => {
-        const seen = new Set<string>()
-        const results: Array<{ name: string; artist: string; uri: string }> = []
+      const json = await this.agentEval(sandbox, `
+        JSON.stringify((() => {
+          const seen = new Set(), results = [];
+          for (const a of document.querySelectorAll('a[href^="/track/"]')) {
+            const id = a.getAttribute('href').replace('/track/','').split('?')[0];
+            if (!id || seen.has(id)) continue; seen.add(id);
+            const name = a.textContent?.trim(); if (!name) continue;
+            const row = a.closest('[data-testid="tracklist-row"]')
+                     ?? a.closest('[role="row"]')
+                     ?? a.parentElement?.parentElement;
+            const artist = row?.querySelector('a[href^="/artist/"]')?.textContent?.trim() ?? '';
+            results.push({ name, artist, uri: 'spotify:track:' + id });
+            if (results.length >= ${limit}) break;
+          }
+          return results;
+        })())
+      `)
 
-        for (const link of Array.from(document.querySelectorAll('a[href^="/track/"]'))) {
-          const href = (link as HTMLAnchorElement).getAttribute("href") ?? ""
-          const id = href.replace("/track/", "").split("?")[0].trim()
-          if (!id || seen.has(id)) continue
-          seen.add(id)
-
-          const name = link.textContent?.trim() ?? ""
-          if (!name) continue
-
-          const row =
-            link.closest('[data-testid="tracklist-row"]') ??
-            link.closest('[role="row"]') ??
-            link.parentElement?.parentElement?.parentElement
-          const artist =
-            row?.querySelector('a[href^="/artist/"]')?.textContent?.trim() ?? ""
-
-          results.push({ name, artist, uri: `spotify:track:${id}` })
-          if (results.length >= lim) break
-        }
-        return results
-      }, limit)
-
-      return tracks.filter((t) => t.name && t.uri.startsWith("spotify:track:"))
+      try {
+        return (JSON.parse(json) as Array<{ name: string; artist: string; uri: string }>)
+          .filter(t => t.name && t.uri.startsWith("spotify:track:"))
+      } catch { return [] }
     })
   }
 
   /**
-   * Crea una playlist y agrega tracks.
-   * Toda la interacción UI se hace via screenshot + Haiku.
+   * Crea una playlist completa: crea → renombra → agrega tracks.
+   * Todo dentro de un único microVM efímero.
    */
   async createPlaylist(
     name: string,
     description: string,
     trackQueries: string[]
   ): Promise<{ url: string; trackCount: number }> {
-    return this.withBrowser(async (page) => {
-      console.log("[spotify-agent] navigating to open.spotify.com")
-      await page.goto("https://open.spotify.com", {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      })
-      this.assertNotLoginPage(page.url())
-      await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {})
-      await page.waitForTimeout(1500)
+    return this.withSandbox(async (sandbox) => {
+      console.log("[sandbox] injecting session and loading Spotify")
+      await this.injectCookies(sandbox)
+      await this.agentOpen(sandbox, "https://open.spotify.com")
 
-      // ── PASO 1: Crear playlist vacía ───────────────────────────────────────
-      const playlistUrl = await this.runLoop(
-        page,
-        `Create a new empty Spotify playlist:
-1. If a cookie/GDPR consent banner is visible, dismiss it first (click Accept or Reject).
-2. In the LEFT SIDEBAR, find the "+" button or "Create playlist" button near "Your Library" and click it.
-3. If a dropdown appears with options like "Playlist", "Blend", "Folder" — click "Playlist".
-4. Wait for the page to navigate to a new playlist URL that contains /playlist/.
-5. Once on the playlist page, return done with the current page URL as result.`,
-        async (p) => {
-          const id = p.url().split("/playlist/")[1]?.split("?")[0]
-          return id ? p.url() : null
-        }
+      let url = await this.agentGetUrl(sandbox)
+      this.assertNotLogin(url)
+      await this.sleep(2000) // Web Player initialization
+
+      // ── Cookie banner ─────────────────────────────────────────────────────
+      await this.findAndClick(
+        sandbox,
+        ["Accept cookies", "Accept", "Reject"],
+        `document.querySelector('[id*="accept" i],[data-testid*="accept" i]')?.click()`
+      ).catch(() => {})
+
+      // ── Crear playlist ────────────────────────────────────────────────────
+      console.log("[sandbox] creating playlist")
+      await this.findAndClick(
+        sandbox,
+        ["Create playlist", "New playlist"],
+        `document.querySelector('[aria-label*="Create playlist" i],[aria-label*="New playlist" i]')?.click()`
       )
+      await this.sleep(600)
 
-      const playlistId = playlistUrl.split("/playlist/")[1]?.split("?")[0]
-      if (!playlistId) throw new Error("Could not extract playlist ID")
+      // Si aparece dropdown con "Playlist / Blend / Folder"
+      await this.findAndClick(
+        sandbox,
+        ["Playlist"],
+        `[...document.querySelectorAll('[role="menuitem"]')].find(el => el.textContent?.trim() === 'Playlist')?.click()`
+      ).catch(() => {})
+      await this.sleep(1500)
+
+      // Esperar navegación a /playlist/{id}
+      for (let i = 0; i < 12; i++) {
+        url = await this.agentGetUrl(sandbox)
+        if (url.includes("/playlist/")) break
+        await this.sleep(700)
+      }
+
+      const playlistId = url.split("/playlist/")[1]?.split("?")[0]
+      if (!playlistId) throw new Error("Could not navigate to playlist page")
       const canonicalUrl = `https://open.spotify.com/playlist/${playlistId}`
-      console.log("[spotify-agent] playlist created:", canonicalUrl)
+      console.log("[sandbox] playlist created:", canonicalUrl)
 
-      // ── PASO 2: Renombrar la playlist ───────────────────────────────────────
-      console.log("[spotify-agent] renaming to:", name)
-      await this.runLoop(
-        page,
-        `Rename this Spotify playlist to exactly: "${name}"
-1. Find the editable playlist title on screen (usually shows "My Playlist #N") or find an "Edit details" pencil icon and click it.
-2. If a modal/dialog opens with a name input field, click inside the field.
-3. Select all existing text in the field (Ctrl+A or triple-click) and delete it.
-4. Type the new name: ${name}
-5. Click the Save button or press Enter to confirm.
-6. Return done once the name has been saved.`,
-        async (p) => {
-          // Verificar si el título del documento o h1 cambió
-          const title = await p.evaluate(() => {
-            const el =
-              document.querySelector('[data-testid="playlist-title"]') ??
-              document.querySelector('h1')
-            return el?.textContent?.trim() ?? ""
-          })
-          return title === name ? "renamed" : null
-        },
-        10
-      ).catch((e) =>
-        console.log("[spotify-agent] rename failed (continuing):", String(e).slice(0, 80))
-      )
+      // ── Renombrar ─────────────────────────────────────────────────────────
+      console.log("[sandbox] renaming to:", name)
+      await this.renamePlaylist(sandbox, name)
 
-      // ── PASO 3: Agregar tracks ──────────────────────────────────────────────
-      console.log("[spotify-agent] adding", trackQueries.length, "tracks")
+      // ── Agregar tracks ────────────────────────────────────────────────────
+      console.log("[sandbox] adding", trackQueries.length, "tracks")
       let trackCount = 0
-      for (const query of trackQueries.slice(0, 15)) {
+      for (const query of trackQueries.slice(0, 50)) {
         try {
-          const added = await this.addOneTrack(page, query, name)
-          if (added) trackCount++
+          if (await this.addOneTrack(sandbox, query, name)) trackCount++
         } catch (e) {
-          console.log("[spotify-agent] track failed:", query, String(e).slice(0, 60))
+          console.log("[sandbox] track failed:", query, String(e).slice(0, 60))
         }
       }
 
-      console.log("[spotify-agent] done. tracks:", trackCount)
+      console.log("[sandbox] done. tracks:", trackCount)
       return { url: canonicalUrl, trackCount }
-    })
+    }, 600_000) // 10 min para playlists grandes
   }
 
-  /**
-   * Agrega UN track a la playlist via screenshot agent.
-   * Flujo: hover row → click ⋯ → click "Add to playlist" → click playlist name.
-   */
+  private async renamePlaylist(sandbox: Sandbox, name: string): Promise<void> {
+    await this.sleep(500)
+
+    // Estrategia 1: botón "Edit details" → modal con input
+    const editClicked = await this.findAndClick(
+      sandbox,
+      ["Edit details", "Edit playlist"],
+      `document.querySelector('[aria-label*="Edit details" i]')?.click()`
+    )
+
+    if (editClicked) {
+      await this.sleep(700)
+      // Actualizar el input name en React (requiere el setter nativo para componentes controlados)
+      await this.agentEval(sandbox, `
+        const inp = document.querySelector('input[name="name"], input[placeholder*="name" i]');
+        if (inp) {
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+          setter.call(inp, ${JSON.stringify(name)});
+          inp.dispatchEvent(new Event('input', { bubbles: true }));
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      `)
+      await this.sleep(300)
+      // Save
+      await this.findAndClick(
+        sandbox,
+        ["Save"],
+        `document.querySelector('[aria-label="Save"],button[type="submit"]')?.click()`
+      )
+    } else {
+      // Estrategia 2: title contenteditable directo
+      await this.agentEval(sandbox, `
+        const el = document.querySelector('[data-testid="playlist-title"], [contenteditable="true"]');
+        if (el) {
+          el.focus();
+          document.execCommand('selectAll');
+          document.execCommand('insertText', false, ${JSON.stringify(name)});
+        }
+      `)
+      await this.sleep(200)
+      await this.agentEval(sandbox, `document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',bubbles:true}))`)
+    }
+
+    await this.sleep(500)
+    console.log("[sandbox] rename done")
+  }
+
   private async addOneTrack(
-    page: Page,
+    sandbox: Sandbox,
     query: string,
     playlistName: string
   ): Promise<boolean> {
-    await page.goto(
-      `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`,
-      { waitUntil: "domcontentloaded", timeout: 15000 }
+    await this.agentOpen(
+      sandbox,
+      `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`
     )
-    await page.waitForSelector('a[href^="/track/"]', { timeout: 8000 }).catch(() => {})
-    await page.waitForTimeout(800)
+    await this.sleep(800)
 
-    try {
-      await this.runLoop(
-        page,
-        `Add the FIRST track from these search results to a playlist named "${playlistName}":
-1. Look at the FIRST track row in the results list. Move mouse over it to reveal hidden buttons.
-2. Click the three-dots (⋯) "More options" button that appears on the right side of the FIRST track row when hovered.
-3. When a context menu pops up, click the "Add to playlist" option.
-4. When a sub-menu or popover appears showing a list of playlists, find and click "${playlistName}".
-5. Return done when you have clicked the playlist name or see a confirmation toast.`,
-        async () => null,
-        8
-      )
-      return true
-    } catch {
-      return false
-    }
+    // Hover sobre el primer track row para revelar el botón ⋯
+    await this.agentEval(sandbox, `
+      document.querySelector('[data-testid="tracklist-row"], [role="row"]')
+        ?.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
+    `)
+    await this.sleep(400)
+
+    // Click ⋯ (More options)
+    const moreClicked = await this.findAndClick(
+      sandbox,
+      ["More options"],
+      `document.querySelector('button[aria-label="More options"], [data-testid="more-button"]')?.click()`
+    )
+    if (!moreClicked) return false
+    await this.sleep(400)
+
+    // Click "Add to playlist"
+    const addClicked = await this.findAndClick(
+      sandbox,
+      ["Add to playlist"],
+      `[...document.querySelectorAll('[role="menuitem"]')].find(el => el.textContent?.includes('Add to playlist'))?.click()`
+    )
+    if (!addClicked) return false
+    await this.sleep(600)
+
+    // Click el nombre de la playlist en el submenú
+    await this.findAndClick(
+      sandbox,
+      [playlistName],
+      `[...document.querySelectorAll('[role="menuitem"], [role="option"]')]
+        .find(el => el.textContent?.includes(${JSON.stringify(playlistName)}))?.click()`
+    )
+    await this.sleep(400)
+    return true
   }
 
   /**
    * Busca un track y lo pone a reproducir en el Web Player.
-   * Inicializa el Web Player navegando a la homepage primero.
    */
   async playTrack(query: string): Promise<{ name: string; artist: string }> {
-    return this.withBrowser(async (page) => {
-      // Inicializar el Web Player (necesario para que sea el dispositivo activo)
-      await page.goto("https://open.spotify.com", {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      })
-      this.assertNotLoginPage(page.url())
-      await page.waitForTimeout(2000)
+    return this.withSandbox(async (sandbox) => {
+      await this.injectCookies(sandbox)
+      // Cargar homepage para inicializar el Web Player como dispositivo activo
+      await this.agentOpen(sandbox, "https://open.spotify.com")
+      await this.sleep(2000)
 
-      // Navegar a resultados de búsqueda
-      await page.goto(
-        `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`,
-        { waitUntil: "domcontentloaded", timeout: 15000 }
+      await this.agentOpen(
+        sandbox,
+        `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`
       )
-      this.assertNotLoginPage(page.url())
-      await page.waitForSelector('a[href^="/track/"]', { timeout: 8000 }).catch(() => {})
-      await page.waitForTimeout(800)
+      this.assertNotLogin(await this.agentGetUrl(sandbox))
+      await this.sleep(800)
 
-      // Extraer info del primer track (DOM, sin IA)
-      const trackInfo = await page.evaluate(() => {
-        const row = document.querySelector('[data-testid="tracklist-row"]')
-        if (!row) return { name: "", artist: "" }
-        return {
-          name: row.querySelector('a[href^="/track/"]')?.textContent?.trim() ?? "",
-          artist: row.querySelector('a[href^="/artist/"]')?.textContent?.trim() ?? "",
-        }
-      })
+      // Extraer info del primer track via DOM (sin AI)
+      const infoJson = await this.agentEval(sandbox, `
+        JSON.stringify((() => {
+          const row = document.querySelector('[data-testid="tracklist-row"]');
+          return {
+            name: row?.querySelector('a[href^="/track/"]')?.textContent?.trim() ?? '',
+            artist: row?.querySelector('a[href^="/artist/"]')?.textContent?.trim() ?? '',
+          };
+        })())
+      `)
+      const info = JSON.parse(infoJson) as { name: string; artist: string }
 
-      await this.runLoop(
-        page,
-        `Play the FIRST track in the search results:
-1. Look at the first track row. Hover over it to reveal the green play button (▶).
-2. Click the green play/triangle button on the FIRST track row.
-3. Return done when you've clicked the play button or when the bottom player bar shows a track playing.`,
-        async (p) => {
-          const playing = await p.evaluate(() =>
-            document.querySelector('[data-testid="context-item-link"]')?.textContent?.trim() ?? null
-          )
-          return playing ? `playing:${playing}` : null
-        },
-        6
-      ).catch(() => {})
+      // Hover + click play button
+      await this.agentEval(sandbox, `
+        document.querySelector('[data-testid="tracklist-row"]')
+          ?.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
+      `)
+      await this.sleep(400)
+      await this.findAndClick(
+        sandbox,
+        ["Play"],
+        `document.querySelector('[data-testid="play-button"], button[aria-label*="Play" i]')?.click()`
+      )
 
-      console.log("[spotify-agent] playTrack:", trackInfo.name, "-", trackInfo.artist)
-      return { name: trackInfo.name || query, artist: trackInfo.artist }
+      console.log("[sandbox] playTrack:", info.name, "-", info.artist)
+      return { name: info.name || query, artist: info.artist }
     })
   }
 
   /**
-   * Pausa o reanuda la reproducción.
-   * Encuentra el botón play/pause en la barra inferior via screenshot.
+   * Pausa o reanuda la reproducción via CDP eval (sin screenshots).
    */
   async pausePlayback(): Promise<void> {
-    return this.withBrowser(async (page) => {
-      await page.goto("https://open.spotify.com", {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      })
-      this.assertNotLoginPage(page.url())
-      await page.waitForTimeout(2500)
+    return this.withSandbox(async (sandbox) => {
+      await this.injectCookies(sandbox)
+      await this.agentOpen(sandbox, "https://open.spotify.com")
+      await this.sleep(2500)
 
-      await this.runLoop(
-        page,
-        `Toggle play/pause in the Spotify player bar at the BOTTOM of the screen:
-1. Find the large circular play/pause button in the CENTER of the bottom player bar.
-2. Click it once.
-3. Return done immediately after clicking it.`,
-        async () => null,
-        4
-      ).catch((e) =>
-        console.log("[spotify-agent] pausePlayback failed:", String(e).slice(0, 80))
+      await this.findAndClick(
+        sandbox,
+        ["Pause", "Play"],
+        `document.querySelector('[data-testid="control-button-playpause"]')?.click()`
       )
+      console.log("[sandbox] pausePlayback toggled")
     })
   }
 
   /**
-   * Salta a la siguiente canción.
-   * Encuentra el botón skip-forward en la barra inferior via screenshot.
+   * Salta a la siguiente canción via CDP eval (sin screenshots).
    */
   async skipToNext(): Promise<void> {
-    return this.withBrowser(async (page) => {
-      await page.goto("https://open.spotify.com", {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      })
-      this.assertNotLoginPage(page.url())
-      await page.waitForTimeout(2500)
+    return this.withSandbox(async (sandbox) => {
+      await this.injectCookies(sandbox)
+      await this.agentOpen(sandbox, "https://open.spotify.com")
+      await this.sleep(2500)
 
-      await this.runLoop(
-        page,
-        `Skip to the next track using the bottom player bar:
-1. Find the skip-to-next button (⏭ forward arrows / double chevron pointing right) in the bottom bar, to the RIGHT of the play/pause button.
-2. Click it once.
-3. Return done immediately after clicking it.`,
-        async () => null,
-        4
-      ).catch((e) =>
-        console.log("[spotify-agent] skipToNext failed:", String(e).slice(0, 80))
+      await this.findAndClick(
+        sandbox,
+        ["Next", "Skip to next"],
+        `document.querySelector('[data-testid="control-button-skip-forward"]')?.click()`
       )
+      console.log("[sandbox] skipToNext clicked")
     })
   }
 
   /**
-   * Lee qué está sonando actualmente — extracción DOM, sin visión.
+   * Lee la canción actual — extracción DOM pura, sin AI.
    */
   async getNowPlaying(): Promise<{ name: string; artist: string } | null> {
-    return this.withBrowser(async (page) => {
-      await page.goto("https://open.spotify.com", {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      })
-      this.assertNotLoginPage(page.url())
-      await page.waitForTimeout(2500)
+    return this.withSandbox(async (sandbox) => {
+      await this.injectCookies(sandbox)
+      await this.agentOpen(sandbox, "https://open.spotify.com")
+      await this.sleep(2500)
 
-      return page.evaluate(() => {
-        const track = document
-          .querySelector('[data-testid="context-item-link"]')
-          ?.textContent?.trim()
-        const artist = document
-          .querySelector('[data-testid="context-item-info-artist"]')
-          ?.textContent?.trim()
-        if (!track) return null
-        return { name: track, artist: artist ?? "" }
-      })
+      const json = await this.agentEval(sandbox, `
+        JSON.stringify((() => {
+          const track = document.querySelector('[data-testid="context-item-link"]')?.textContent?.trim();
+          const artist = document.querySelector('[data-testid="context-item-info-artist"]')?.textContent?.trim();
+          return track ? { name: track, artist: artist ?? '' } : null;
+        })())
+      `)
+      try { return JSON.parse(json) } catch { return null }
     })
+  }
+
+  /**
+   * Crea un snapshot del sandbox con agent-browser pre-instalado.
+   * Correr UNA SOLA VEZ. Guardar el ID en AGENT_BROWSER_SNAPSHOT_ID.
+   *
+   * Con snapshot: cold start ~1s (vs ~30s sin snapshot).
+   */
+  async createSnapshot(): Promise<string> {
+    console.log("[sandbox] creating snapshot — this takes ~2 minutes")
+    const sb = await Sandbox.create({ runtime: "node24", timeout: 300_000 })
+    await sb.runCommand("sh", ["-c",
+      `sudo dnf install -y --skip-broken ${CHROMIUM_DEPS.join(" ")} 2>&1 | tail -3`,
+    ])
+    await sb.runCommand("npm", ["install", "-g", "agent-browser"])
+    await sb.runCommand("npx", ["agent-browser", "install"])
+    const snap = await sb.snapshot()
+    console.log("[sandbox] snapshot ID:", snap.snapshotId)
+    console.log("[sandbox] set AGENT_BROWSER_SNAPSHOT_ID=" + snap.snapshotId)
+    return snap.snapshotId
   }
 }
 
