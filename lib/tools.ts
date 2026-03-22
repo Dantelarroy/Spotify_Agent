@@ -57,16 +57,24 @@ function wrapSpotifyCall<T>(fn: () => Promise<T>, onExpired: () => Promise<void>
   return fn().catch(async (err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err)
     console.error("[wrapSpotifyCall] error:", msg)
-    // Only invalidate the DB session when we have confirmed the session is dead:
-    // SPOTIFY_SESSION_DEAD = anonymous token, 401, or missing sp_dc
-    // SPOTIFY_NOT_CONNECTED = no sp_dc at all in stored cookies
-    if (msg.includes("SPOTIFY_NOT_CONNECTED")) {
+    // Invalidate only when we have strong evidence that the session is dead.
+    const sessionDead = [
+      "SPOTIFY_NOT_CONNECTED",
+      "redirected to login",
+      "accounts.spotify.com",
+      "anonymous token",
+      "401",
+      "missing sp_dc",
+    ].some((marker) => msg.toLowerCase().includes(marker.toLowerCase()))
+
+    if (sessionDead) {
       console.error("[wrapSpotifyCall] invalidating session")
       await onExpired()
-      throw err
+      throw new Error("SPOTIFY_NOT_CONNECTED: " + msg)
     }
-    // Re-throw with a consistent error code for the UI to detect
-    throw new Error("SPOTIFY_NOT_CONNECTED: " + msg)
+
+    // Preserve non-auth failures as operational errors, not auth disconnections.
+    throw err instanceof Error ? err : new Error(msg)
   })
 }
 

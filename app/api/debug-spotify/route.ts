@@ -51,13 +51,22 @@ export async function GET() {
   }
 
   return NextResponse.json({
-    stage: tokenStatus === 200 ? "success" : "token_endpoint_failed",
+    stage:
+      tokenStatus === 200
+        ? "success"
+        : tokenStatus === 400 &&
+          JSON.stringify(tokenResponse).includes("not permitted under the Spotify Developer Terms")
+        ? "token_probe_blocked_policy"
+        : "token_endpoint_failed",
     tokenStatus,
     isAnonymous: (tokenResponse as { isAnonymous?: boolean }).isAnonymous,
     hasAccessToken: !!(tokenResponse as { accessToken?: string }).accessToken,
+    connectedLikely:
+      tokenStatus === 200 ||
+      (tokenStatus === 400 &&
+        JSON.stringify(tokenResponse).includes("not permitted under the Spotify Developer Terms")),
     storedCookies: cookieNames,
     spDcPresent: true,
-    spDcValuePrefix: spDc.value.substring(0, 15) + "...",
     // error detail if any
     tokenError: tokenStatus !== 200 ? tokenResponse : undefined,
   })
