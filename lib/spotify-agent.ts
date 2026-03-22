@@ -280,6 +280,34 @@ async function ensureSearchTracksView(page, query) {
     '[role="tab"]:has-text("Musicas")',
   ], 1200);
   await page.waitForTimeout(350);
+  await page.waitForSelector('a[href*="/track/"], [data-testid="tracklist-row"]', { timeout: 9000 }).catch(() => null);
+}
+
+async function collectTrackCandidates(page, limit = 20) {
+  return page.evaluate((cap) => {
+    const out = [];
+    const seen = new Set();
+    const links = [...document.querySelectorAll('a[href*="/track/"]')];
+    for (const a of links) {
+      const href = String(a.getAttribute('href') || '');
+      const m = href.match(/\/track\/([a-zA-Z0-9]+)/);
+      if (!m) continue;
+      const id = m[1];
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const row =
+        a.closest('[data-testid="tracklist-row"]') ||
+        a.closest('[role="row"]') ||
+        a.closest('div[role="listitem"]') ||
+        a.parentElement;
+      const name = (a.textContent || '').trim();
+      const artist = (row?.querySelector?.('a[href*="/artist/"]')?.textContent || '').trim();
+      if (!name) continue;
+      out.push({ id, name, artist, href, rowHasPlayButton: Boolean(row?.querySelector?.('[data-testid="play-button"], button[aria-label*="Play" i]')) });
+      if (out.length >= cap) break;
+    }
+    return out;
+  }, Math.max(1, Math.min(50, limit))).catch(() => []);
 }
 
 async function countPlaylistTrackLinks(page, playlistUrl) {
@@ -579,11 +607,11 @@ try {
   }
 
   result.phase = 'add_tracks';
-  trace('add_tracks_start', { queryCount: queries.length });
   const queries = (Array.isArray(input.trackQueries) ? input.trackQueries : [])
     .map((q) => String(q || '').trim())
     .filter(Boolean)
     .slice(0, 50);
+  trace('add_tracks_start', { queryCount: queries.length });
 
   let trackCount = 0;
   const trackFailures = [];
@@ -721,6 +749,34 @@ async function ensureSearchTracksView(page, query) {
     '[role="tab"]:has-text("Musicas")',
   ], 1200);
   await page.waitForTimeout(350);
+  await page.waitForSelector('a[href*="/track/"], [data-testid="tracklist-row"]', { timeout: 9000 }).catch(() => null);
+}
+
+async function collectTrackCandidates(page, limit = 20) {
+  return page.evaluate((cap) => {
+    const out = [];
+    const seen = new Set();
+    const links = [...document.querySelectorAll('a[href*="/track/"]')];
+    for (const a of links) {
+      const href = String(a.getAttribute('href') || '');
+      const m = href.match(/\/track\/([a-zA-Z0-9]+)/);
+      if (!m) continue;
+      const id = m[1];
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const row =
+        a.closest('[data-testid="tracklist-row"]') ||
+        a.closest('[role="row"]') ||
+        a.closest('div[role="listitem"]') ||
+        a.parentElement;
+      const name = (a.textContent || '').trim();
+      const artist = (row?.querySelector?.('a[href*="/artist/"]')?.textContent || '').trim();
+      if (!name) continue;
+      out.push({ id, name, artist, href, rowHasPlayButton: Boolean(row?.querySelector?.('[data-testid="play-button"], button[aria-label*="Play" i]')) });
+      if (out.length >= cap) break;
+    }
+    return out;
+  }, Math.max(1, Math.min(50, limit))).catch(() => []);
 }
 
 const input = JSON.parse(readFileSync('/tmp/spotify-control-input.json', 'utf8'));
@@ -763,47 +819,36 @@ let page;
       const limit = Math.max(1, Math.min(20, Number(input.limit || 10)));
       const query = String(input.query || '');
       await ensureSearchTracksView(page, query);
-      const tracks = await page.$$eval('[data-testid="tracklist-row"], [role="row"]', (rows, cap) => {
-        const out = [];
-        const seen = new Set();
-        for (const row of rows) {
-          const link = row.querySelector('a[href^="/track/"]');
-          if (!link) continue;
-          const href = link.getAttribute('href') || '';
-          const m = href.match(/\/track\/([a-zA-Z0-9]+)/);
-          if (!m) continue;
-          const id = m[1];
-          if (seen.has(id)) continue;
-          seen.add(id);
-          const name = (link.textContent || '').trim();
-          const artist = (row.querySelector('a[href^="/artist/"]')?.textContent || '').trim();
-          if (!name) continue;
-          out.push({ name, artist, uri: 'spotify:track:' + id });
-          if (out.length >= cap) break;
-        }
-        return out;
-      }, limit).catch(() => []);
+      const candidates = await collectTrackCandidates(page, limit);
+      const tracks = candidates.map((c) => ({ name: c.name, artist: c.artist, uri: 'spotify:track:' + c.id }));
       result.ok = true;
       result.data = tracks;
     } else if (action === 'play_track') {
       const query = String(input.query || '');
       await ensureSearchTracksView(page, query);
-      const row = page.locator('[data-testid="tracklist-row"], [role="row"]').first();
-      if (!(await row.count())) throw new Error('No track rows found');
-      const info = await row.evaluate((el) => {
-        const name = (el.querySelector('a[href^="/track/"]')?.textContent || '').trim();
-        const artist = (el.querySelector('a[href^="/artist/"]')?.textContent || '').trim();
-        return { name, artist };
-      }).catch(() => ({ name: '', artist: '' }));
-      await row.hover({ timeout: 1200 }).catch(() => null);
+      const candidates = await collectTrackCandidates(page, 10);
+      if (!candidates.length) throw new Error('No tracks found on search page');
+      const first = candidates[0];
+
+      // Prefer explicit row play button, fallback to open track link and hit top play.
       const clicked = await clickFirst(page, [
         '[data-testid="tracklist-row"] [data-testid="play-button"]',
         '[data-testid="tracklist-row"] button[aria-label*="Play" i]',
         'button[aria-label*="Play" i]',
       ], 1400);
-      if (!clicked) throw new Error('Could not click play control');
+      if (!clicked && first?.href) {
+        const href = first.href.startsWith('http') ? first.href : ('https://open.spotify.com' + first.href);
+        await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => null);
+        await page.waitForTimeout(700);
+      }
+      const clickedFallback = clicked || await clickFirst(page, [
+        '[data-testid="control-button-playpause"]',
+        'button[data-testid="play-button"]',
+        'button[aria-label*="Play" i]',
+      ], 1600);
+      if (!clickedFallback) throw new Error('Could not click play control');
       result.ok = true;
-      result.data = { name: info.name || query, artist: info.artist || '' };
+      result.data = { name: first.name || query, artist: first.artist || '' };
     } else if (action === 'pause_playback') {
       const clicked = await clickFirst(page, ['[data-testid="control-button-playpause"]', 'button[aria-label*="Pause" i]', 'button[aria-label*="Play" i]'], 1400);
       if (!clicked) throw new Error('Could not toggle play/pause');
