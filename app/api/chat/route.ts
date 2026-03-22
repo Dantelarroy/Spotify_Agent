@@ -63,15 +63,52 @@ export async function POST(req: Request) {
     await invalidateSpotifySession(userId)
   })
 
+  const modelMessages = await safeConvertMessages(messages)
+
   const result = streamText({
     model: anthropic("claude-sonnet-4-6"),
     system: buildSystemPrompt(prefs),
-    messages: await convertToModelMessages(messages),
+    messages: modelMessages,
     tools,
     stopWhen: stepCountIs(10),
   })
 
   return result.toUIMessageStreamResponse()
+}
+
+async function safeConvertMessages(messages: UIMessage[]) {
+  try {
+    return await convertToModelMessages(messages)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (!msg.includes("AI_MissingToolResultsError")) throw err
+
+    // Recover from partial/in-flight tool calls left in client history.
+    // Keep text and completed tool outputs only.
+    const repaired = messages
+      .map((m) => {
+        const parts = m.parts.filter((part) => {
+          if (isTextPart(part)) return true
+          if (!isToolPart(part)) return true
+          const state = String((part as { state?: unknown }).state ?? "")
+          return state.startsWith("output-")
+        })
+        return { ...m, parts }
+      })
+      .filter((m) => m.parts.length > 0)
+
+    return convertToModelMessages(repaired)
+  }
+}
+
+function isTextPart(part: unknown): part is { type: "text"; text?: string } {
+  return !!part && typeof part === "object" && (part as { type?: unknown }).type === "text"
+}
+
+function isToolPart(part: unknown): part is { type: string; state?: string } {
+  if (!part || typeof part !== "object") return false
+  const type = (part as { type?: unknown }).type
+  return typeof type === "string" && type.startsWith("tool-")
 }
 
 function buildSystemPrompt(prefs: { blacklist: string[]; whitelist: string[]; notes: string[] }) {
