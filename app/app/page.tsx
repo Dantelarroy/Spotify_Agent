@@ -141,16 +141,29 @@ export default function ChatPage() {
                 const toolName = part.type.replace("tool-", "")
                 const label = TOOL_LABELS[toolName] ?? toolName
                 const isDone = part.state === "output-available" || part.state === "output-error" || part.state === "output-denied"
+                const errorText =
+                  part.state === "output-error" && typeof (part as unknown as { errorText?: unknown }).errorText === "string"
+                    ? ((part as unknown as { errorText: string }).errorText)
+                    : null
                 return (
-                  <div key={partIndex} className="flex items-center gap-2 text-xs text-gray-500 py-0.5 px-2">
-                    {!isDone ? (
-                      <Loader2 size={10} className="animate-spin text-[#1db954] flex-shrink-0" />
-                    ) : (
-                      <span className="text-[#1db954] flex-shrink-0">✓</span>
+                  <div key={partIndex} className="py-0.5 px-2">
+                    <div className="flex items-center gap-2 text-xs text-gray-500">
+                      {!isDone ? (
+                        <Loader2 size={10} className="animate-spin text-[#1db954] flex-shrink-0" />
+                      ) : part.state === "output-error" ? (
+                        <span className="text-red-400 flex-shrink-0">✕</span>
+                      ) : (
+                        <span className="text-[#1db954] flex-shrink-0">✓</span>
+                      )}
+                      <span className={isDone ? "text-gray-600" : "text-gray-400"}>
+                        {isDone ? label : `${label}...`}
+                      </span>
+                    </div>
+                    {errorText && (
+                      <div className="mt-1 text-xs text-red-400/90">
+                        {errorText}
+                      </div>
                     )}
-                    <span className={isDone ? "text-gray-600" : "text-gray-400"}>
-                      {isDone ? label : `${label}...`}
-                    </span>
                   </div>
                 )
               }

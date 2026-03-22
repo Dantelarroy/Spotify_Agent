@@ -91,6 +91,63 @@ export class SpotifyAgent {
     this.cookies = cookies
   }
 
+  private describeSandboxError(err: unknown): string {
+    if (!err || typeof err !== "object") {
+      return String(err)
+    }
+    const e = err as {
+      message?: string
+      response?: { status?: number; statusText?: string; url?: string }
+      json?: unknown
+      text?: string
+      sandboxId?: string
+    }
+    const parts = [
+      e.message ?? "unknown sandbox error",
+      e.response?.status ? `status=${e.response.status}` : "",
+      e.response?.url ? `url=${e.response.url}` : "",
+      e.sandboxId ? `sandboxId=${e.sandboxId}` : "",
+      e.text ? `text=${String(e.text).slice(0, 240)}` : "",
+      e.json ? `json=${JSON.stringify(e.json).slice(0, 240)}` : "",
+    ].filter(Boolean)
+    return parts.join(" | ")
+  }
+
+  private isRetryableSandboxError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (msg.includes("Status code 400 is not ok")) return true
+    if (msg.includes("Status code 429 is not ok")) return true
+    if (msg.includes("Status code 500 is not ok")) return true
+    return false
+  }
+
+  private async runSandboxCommand(
+    sandbox: Sandbox,
+    label: string,
+    cmd: string,
+    args: string[],
+    retries = 1
+  ) {
+    let lastErr: unknown
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await sandbox.runCommand(cmd, args)
+      } catch (err) {
+        lastErr = err
+        const detail = this.describeSandboxError(err)
+        console.error(
+          `[sandbox][${label}] command failed (attempt ${attempt + 1}/${retries + 1}):`,
+          detail
+        )
+        if (attempt < retries && this.isRetryableSandboxError(err)) {
+          await this.sleep(350)
+          continue
+        }
+      }
+    }
+    throw new Error(`SANDBOX_STEP_FAILED:${label}:${this.describeSandboxError(lastErr)}`)
+  }
+
   // ─── Sandbox lifecycle ──────────────────────────────────────────────────────
 
   private async withSandbox<T>(
@@ -139,9 +196,9 @@ export class SpotifyAgent {
       { path: "/root/inject-cookies.mjs", content: Buffer.from(INJECT_COOKIES_MJS) },
     ])
     // Primera apertura — arranca Chrome con CDP en puerto 9222
-    await sandbox.runCommand("agent-browser", ["open", "about:blank"])
+    await this.runSandboxCommand(sandbox, "open-blank", "agent-browser", ["open", "about:blank"], 2)
     // Inyectar cookies httpOnly via CDP antes de navegar a Spotify
-    const result = await sandbox.runCommand("node", ["/root/inject-cookies.mjs"])
+    const result = await this.runSandboxCommand(sandbox, "inject-cookies", "node", ["/root/inject-cookies.mjs"], 1)
     const stderr = await result.stderr()
     if (stderr) console.log("[sandbox] inject stderr:", stderr.slice(0, 200))
     console.log("[sandbox] session cookies injected via CDP")
@@ -150,18 +207,18 @@ export class SpotifyAgent {
   // ─── agent-browser command helpers ─────────────────────────────────────────
 
   private async agentOpen(sandbox: Sandbox, url: string): Promise<void> {
-    await sandbox.runCommand("agent-browser", ["open", url])
+    await this.runSandboxCommand(sandbox, "open-url", "agent-browser", ["open", url], 2)
     // Esperar que el DOM esté disponible
-    await sandbox.runCommand("agent-browser", ["wait", "body"]).catch(() => {})
+    await this.runSandboxCommand(sandbox, "wait-body", "agent-browser", ["wait", "body"], 1).catch(() => {})
   }
 
   private async agentGetUrl(sandbox: Sandbox): Promise<string> {
-    const r = await sandbox.runCommand("agent-browser", ["get", "url", "--json"])
+    const r = await this.runSandboxCommand(sandbox, "get-url", "agent-browser", ["get", "url", "--json"], 1)
     try { return JSON.parse(await r.stdout())?.data?.url ?? "" } catch { return "" }
   }
 
   private async agentSnapshot(sandbox: Sandbox): Promise<AXElement[]> {
-    const r = await sandbox.runCommand("agent-browser", ["snapshot", "-i"])
+    const r = await this.runSandboxCommand(sandbox, "snapshot", "agent-browser", ["snapshot", "-i"], 1)
     return this.parseSnapshot(await r.stdout())
   }
 
@@ -176,12 +233,12 @@ export class SpotifyAgent {
   }
 
   private async agentClick(sandbox: Sandbox, ref: string): Promise<void> {
-    await sandbox.runCommand("agent-browser", ["click", `@${ref}`])
+    await this.runSandboxCommand(sandbox, "click-ref", "agent-browser", ["click", `@${ref}`], 1)
     await this.sleep(400)
   }
 
   private async agentEval(sandbox: Sandbox, js: string): Promise<string> {
-    const r = await sandbox.runCommand("agent-browser", ["eval", js])
+    const r = await this.runSandboxCommand(sandbox, "eval", "agent-browser", ["eval", js], 1)
     return (await r.stdout()).trim()
   }
 
@@ -209,10 +266,15 @@ export class SpotifyAgent {
     } catch { /* si snapshot falla, caemos al eval */ }
 
     // Fallback CDP eval
-    const result = await this.agentEval(sandbox, fallbackJs)
-    const clicked = result !== "null" && result !== "false" && result !== "undefined" && result !== ""
-    if (clicked) console.log(`[sandbox] eval click (AX fallback)`)
-    return clicked
+    try {
+      const result = await this.agentEval(sandbox, fallbackJs)
+      const clicked = result !== "null" && result !== "false" && result !== "undefined" && result !== ""
+      if (clicked) console.log(`[sandbox] eval click (AX fallback)`)
+      return clicked
+    } catch (e) {
+      console.log("[sandbox] eval fallback failed:", String(e).slice(0, 180))
+      return false
+    }
   }
 
   private assertNotLogin(url: string): void {
