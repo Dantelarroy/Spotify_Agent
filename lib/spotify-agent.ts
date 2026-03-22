@@ -290,6 +290,11 @@ try {
 } catch (err) {
   result.ok = false;
   result.message = err instanceof Error ? err.message : String(err);
+  result.debug = {
+    ...result.debug,
+    playwrightNodeModules: process.env.PLAYWRIGHT_NODE_MODULES || '',
+    playwrightBrowsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || '',
+  };
   try {
     if (page) {
       const screenshotPath = '/tmp/spotify-playlist-error.png';
@@ -387,7 +392,16 @@ export class SpotifyAgent {
     let lastErr: unknown
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        return await sandbox.runCommand(cmd, args)
+        const res = await sandbox.runCommand(cmd, args)
+        const exitCode = typeof res.exitCode === "number" ? res.exitCode : null
+        if (exitCode !== null && exitCode !== 0) {
+          const stderr = await res.stderr().catch(() => "")
+          throw new Error(
+            `command exited with code ${exitCode}` +
+            (stderr ? `; stderr=${stderr.slice(0, 400)}` : "")
+          )
+        }
+        return res
       } catch (err) {
         lastErr = err
         const detail = this.describeSandboxError(err)
@@ -453,7 +467,10 @@ export class SpotifyAgent {
       sandbox,
       "playwright-probe",
       "sh",
-      ["-lc", "node -e \"require('/tmp/pw-runtime/node_modules/playwright'); console.log('ok')\""],
+      [
+        "-lc",
+        "node -e \"require('/tmp/pw-runtime/node_modules/playwright') || require('/tmp/pw-runtime/node_modules/playwright-core'); console.log('ok')\"",
+      ],
       0
     ).catch(() => null)
     if (probe) return
@@ -479,7 +496,10 @@ export class SpotifyAgent {
       sandbox,
       "install-playwright-browser",
       "sh",
-      ["-lc", "cd /tmp/pw-runtime && npx playwright install chromium"],
+      [
+        "-lc",
+        "cd /tmp/pw-runtime && PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-runtime/ms-playwright npx playwright install chromium",
+      ],
       1
     )
     await this.runSandboxCommand(
@@ -488,7 +508,7 @@ export class SpotifyAgent {
       "sh",
       [
         "-lc",
-        "ls -la /tmp/pw-runtime/node_modules | sed -n '1,80p'",
+        "ls -la /tmp/pw-runtime/node_modules | sed -n '1,80p' && ls -la /tmp/pw-runtime/ms-playwright | sed -n '1,80p'",
       ],
       0
     ).catch(() => null)
@@ -519,7 +539,7 @@ export class SpotifyAgent {
       "sh",
       [
         "-lc",
-        "export PLAYWRIGHT_NODE_MODULES=/tmp/pw-runtime/node_modules; node /tmp/pw-create-playlist.cjs || true",
+        "export PLAYWRIGHT_NODE_MODULES=/tmp/pw-runtime/node_modules PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-runtime/ms-playwright; node /tmp/pw-create-playlist.cjs || true",
       ],
       0
     )
