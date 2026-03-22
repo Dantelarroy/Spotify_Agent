@@ -110,7 +110,11 @@ try {
   } catch (err) {
     const nodeModulesRoot = process.env.PLAYWRIGHT_NODE_MODULES || '';
     if (!nodeModulesRoot) throw err;
-    ({ chromium } = require(nodeModulesRoot + '/playwright'));
+    try {
+      ({ chromium } = require(nodeModulesRoot + '/playwright'));
+    } catch {
+      ({ chromium } = require(nodeModulesRoot + '/playwright-core'));
+    }
   }
   browser = await chromium.launch({
     headless: true,
@@ -461,7 +465,13 @@ export class SpotifyAgent {
       "sh",
       [
         "-lc",
-        "mkdir -p /tmp/pw-runtime && cd /tmp/pw-runtime && [ -f package.json ] || npm init -y >/dev/null 2>&1 && npm install playwright --no-audit --no-fund",
+        [
+          "mkdir -p /tmp/pw-runtime",
+          "cd /tmp/pw-runtime",
+          "[ -f package.json ] || npm init -y >/dev/null 2>&1",
+          "npm install playwright playwright-core --no-audit --no-fund",
+          "test -f /tmp/pw-runtime/node_modules/playwright/package.json || test -f /tmp/pw-runtime/node_modules/playwright-core/package.json",
+        ].join(" && "),
       ],
       1
     )
@@ -472,6 +482,16 @@ export class SpotifyAgent {
       ["-lc", "cd /tmp/pw-runtime && npx playwright install chromium"],
       1
     )
+    await this.runSandboxCommand(
+      sandbox,
+      "verify-playwright-runtime",
+      "sh",
+      [
+        "-lc",
+        "ls -la /tmp/pw-runtime/node_modules | sed -n '1,80p'",
+      ],
+      0
+    ).catch(() => null)
   }
 
   private async runPlaywrightPlaylistFlow(
