@@ -239,6 +239,69 @@ async function collectCreateDiagnostics(page) {
   }).catch(() => ({ url: page.url(), controlsSample: [], linksPlaylists: [] }));
 }
 
+async function addFirstSearchResultToPlaylist(page, playlistId, playlistName) {
+  const row = page.locator('[data-testid="tracklist-row"], [role="row"]').first();
+  if (!(await row.count())) return { ok: false, reason: 'no_track_row' };
+
+  await row.hover({ timeout: 1500 }).catch(() => null);
+  const more = row.locator('button[aria-label*="More options" i], [data-testid="more-button"], button[aria-haspopup="menu"]').first();
+  if (!(await more.count())) return { ok: false, reason: 'no_more_button' };
+  await more.click({ timeout: 1800 }).catch(() => null);
+  await page.waitForTimeout(220);
+
+  // Strategy A: direct hit by playlist ID link if visible immediately.
+  const directById = page.locator('a[href*="/playlist/' + playlistId + '"]').first();
+  if (await directById.count()) {
+    await directById.click({ timeout: 1800 }).catch(() => null);
+    return { ok: true, reason: 'clicked_direct_id' };
+  }
+
+  // Strategy B: open/hover likely "Add to playlist" menuitem (language agnostic).
+  const addTerms = ['add', 'añadir', 'agregar', 'adicionar', 'aggiungi', 'ajouter', 'hinzuf'];
+  const items = page.locator('[role="menuitem"]');
+  const itemCount = await items.count();
+  let submenuOpened = false;
+
+  for (let i = 0; i < Math.min(itemCount, 14); i++) {
+    const item = items.nth(i);
+    const txt = normalizeName(await item.textContent());
+    const hasTerm = addTerms.some((t) => txt.includes(t));
+
+    // Prefer semantic match; if absent, probe by hover then check if playlist links appear.
+    if (hasTerm) {
+      await item.hover({ timeout: 1200 }).catch(() => null);
+      await item.click({ timeout: 1200 }).catch(() => null);
+      await page.waitForTimeout(260);
+      submenuOpened = true;
+    } else {
+      await item.hover({ timeout: 900 }).catch(() => null);
+      await page.waitForTimeout(160);
+    }
+
+    const byId = page.locator('a[href*="/playlist/' + playlistId + '"], [role="menuitem"] a[href*="/playlist/' + playlistId + '"]').first();
+    if (await byId.count()) {
+      await byId.click({ timeout: 1800 }).catch(() => null);
+      return { ok: true, reason: 'clicked_submenu_id' };
+    }
+  }
+
+  // Strategy C: fallback by playlist name in visible options.
+  const normalized = normalizeName(playlistName);
+  const playlistOptions = page.locator('[role="menuitem"], [role="option"]');
+  const optionCount = await playlistOptions.count();
+  for (let i = 0; i < Math.min(optionCount, 14); i++) {
+    const opt = playlistOptions.nth(i);
+    const txt = normalizeName(await opt.textContent());
+    if (!txt) continue;
+    if (txt.includes(normalized) || normalized.includes(txt)) {
+      await opt.click({ timeout: 1800 }).catch(() => null);
+      return { ok: true, reason: 'clicked_name_match' };
+    }
+  }
+
+  return { ok: false, reason: submenuOpened ? 'submenu_without_target_playlist' : 'no_add_menu_path' };
+}
+
 const input = JSON.parse(readFileSync('/tmp/spotify-playlist-input.json', 'utf8'));
 const result = {
   ok: false,
@@ -393,6 +456,7 @@ try {
     .slice(0, 50);
 
   let trackCount = 0;
+  const trackFailures = [];
   for (const query of queries) {
     try {
       await page.goto(
@@ -400,45 +464,31 @@ try {
         { waitUntil: 'domcontentloaded', timeout: 60000 }
       );
       await page.waitForTimeout(700);
-      const row = page.locator('[data-testid="tracklist-row"], [role="row"]').first();
-      if (!(await row.count())) continue;
-      await row.hover({ timeout: 1500 }).catch(() => {});
-      await row.locator('button[aria-label*="More options" i], [data-testid="more-button"], button[aria-haspopup="menu"]')
-        .first()
-        .click({ timeout: 1800 });
-      const addMenuItem = page.locator('[role="menuitem"]').filter({ hasText: /Add to playlist/i }).first();
-      if (await addMenuItem.count()) {
-        await addMenuItem.click({ timeout: 1800 });
-      } else {
-        continue;
-      }
-      await page.waitForTimeout(350);
-      const byIdOption = page.locator('a[href*="/playlist/' + playlistId + '"], [role="menuitem"] a[href*="/playlist/' + playlistId + '"]').first();
-      if (await byIdOption.count()) {
-        await byIdOption.click({ timeout: 1800 });
+      const add = await addFirstSearchResultToPlaylist(page, playlistId, playlistName);
+      if (add.ok) {
         trackCount++;
-      } else {
-        const normalized = normalizeName(playlistName);
-        const playlistOptions = page.locator('[role="menuitem"], [role="option"]');
-        const count = await playlistOptions.count();
-        let clicked = false;
-        for (let i = 0; i < Math.min(count, 10); i++) {
-          const opt = playlistOptions.nth(i);
-          const txt = normalizeName(await opt.textContent());
-          if (txt.includes(normalized) || normalized.includes(txt)) {
-            await opt.click({ timeout: 1800 }).catch(() => {});
-            clicked = true;
-            break;
-          }
-        }
-        if (!clicked && count > 0) {
-          await playlistOptions.first().click({ timeout: 1800 }).catch(() => {});
-          clicked = true;
-        }
-        if (clicked) trackCount++;
+      } else if (trackFailures.length < 8) {
+        trackFailures.push({ query, reason: add.reason, url: page.url() });
       }
       await page.waitForTimeout(250);
-    } catch {}
+    } catch (err) {
+      if (trackFailures.length < 8) {
+        trackFailures.push({
+          query,
+          reason: 'exception',
+          detail: err instanceof Error ? err.message.slice(0, 140) : String(err).slice(0, 140),
+          url: page.url(),
+        });
+      }
+    }
+  }
+
+  if (trackFailures.length > 0) {
+    result.debug = {
+      ...result.debug,
+      trackFailures,
+      queryCount: queries.length,
+    };
   }
 
   result.ok = true;
