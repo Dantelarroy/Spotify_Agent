@@ -104,7 +104,14 @@ let browser;
 let page;
 ;(async () => {
 try {
-  const { chromium } = require('playwright');
+  let chromium;
+  try {
+    ({ chromium } = require('playwright'));
+  } catch (err) {
+    const globalRoot = process.env.PLAYWRIGHT_GLOBAL_ROOT || '';
+    if (!globalRoot) throw err;
+    ({ chromium } = require(globalRoot + '/playwright'));
+  }
   browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
@@ -450,7 +457,7 @@ export class SpotifyAgent {
       sandbox,
       "install-playwright-package",
       "npm",
-      ["install", "-g", "playwright"],
+      ["install", "-g", "playwright", "--unsafe-perm=true"],
       1
     )
     await this.runSandboxCommand(
@@ -485,7 +492,10 @@ export class SpotifyAgent {
       sandbox,
       "playwright-create-playlist",
       "sh",
-      ["-lc", "export NODE_PATH=$(npm root -g); node /tmp/pw-create-playlist.cjs || true"],
+      [
+        "-lc",
+        "export PLAYWRIGHT_GLOBAL_ROOT=$(npm root -g); node /tmp/pw-create-playlist.cjs || true",
+      ],
       0
     )
     const stdout = await run.stdout()
