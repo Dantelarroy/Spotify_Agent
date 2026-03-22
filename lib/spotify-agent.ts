@@ -133,6 +133,112 @@ async function clickFirst(page, selectors, timeout = 1800) {
   return false;
 }
 
+async function ensurePlaylistsView(page) {
+  await page.goto('https://open.spotify.com/collection/playlists', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(800);
+
+  // Spotify sometimes lands on /collection/tracks despite direct navigation.
+  if (page.url().includes('/collection/tracks')) {
+    const switched = await clickFirst(page, [
+      'a[href*="/collection/playlists"]',
+      '[role="tab"][href*="/collection/playlists"]',
+      '[role="tablist"] a[href*="playlists"]',
+    ], 1200);
+    if (switched) await page.waitForTimeout(700);
+  }
+}
+
+async function clickCreatePlaylistHeuristic(page) {
+  const direct = await clickFirst(page, [
+    'button[data-testid*="create-playlist" i]',
+    '[data-testid*="create-playlist" i] button',
+    '[data-testid*="add-button" i]',
+    'button[aria-label*="playlist" i]',
+    'button[aria-label*="create" i]',
+  ], 2200);
+  if (direct) return true;
+
+  const result = await page.evaluate(() => {
+    const terms = ['create', 'new', 'playlist', 'crear', 'nueva', 'lista'];
+    const nodes = [...document.querySelectorAll('button,[role="button"],a')];
+    let best = null;
+    let bestScore = -1;
+
+    for (const el of nodes) {
+      const text = (el.textContent || '').toLowerCase().trim();
+      const aria = (el.getAttribute('aria-label') || '').toLowerCase().trim();
+      const testid = (el.getAttribute('data-testid') || '').toLowerCase().trim();
+      const cls = (el.getAttribute('class') || '').toLowerCase();
+
+      let score = 0;
+      if (testid.includes('create')) score += 8;
+      if (testid.includes('playlist')) score += 8;
+      if (testid.includes('add')) score += 4;
+      if (aria.includes('playlist') || aria.includes('lista')) score += 6;
+      if (aria.includes('create') || aria.includes('crear') || aria.includes('new') || aria.includes('nueva')) score += 5;
+      if (terms.some((t) => text.includes(t))) score += 4;
+      if (cls.includes('sidebar') || cls.includes('library')) score += 2;
+      if (el.closest('[data-testid*="library" i], [aria-label*="library" i], [aria-label*="biblioteca" i]')) score += 3;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    }
+
+    if (best && bestScore >= 7) {
+      best.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      return { clicked: true, bestScore };
+    }
+    return { clicked: false, bestScore };
+  }).catch(() => ({ clicked: false, bestScore: -1 }));
+
+  return Boolean(result?.clicked);
+}
+
+async function clickPlaylistMenuOption(page) {
+  const viaSelector = await clickFirst(page, [
+    '[role="menuitem"]:has-text("Playlist")',
+    '[role="menuitem"]:has-text("playlist")',
+    '[role="menuitem"]:has-text("Lista")',
+    '[role="menuitem"]:has-text("lista")',
+    'button:has-text("Playlist")',
+    'button:has-text("Lista")',
+  ], 1500);
+  if (viaSelector) return true;
+
+  return page.evaluate(() => {
+    const terms = ['playlist', 'lista', 'reproducción', 'reproducao'];
+    const items = [...document.querySelectorAll('[role="menuitem"],button,[role="button"]')];
+    const target = items.find((el) => {
+      const text = (el.textContent || '').toLowerCase();
+      return terms.some((t) => text.includes(t));
+    });
+    if (!target) return false;
+    target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    return true;
+  }).catch(() => false);
+}
+
+async function collectCreateDiagnostics(page) {
+  return page.evaluate(() => {
+    const controls = [...document.querySelectorAll('button,[role="button"],a')]
+      .slice(0, 120)
+      .map((el) => ({
+        text: (el.textContent || '').trim().slice(0, 80),
+        aria: (el.getAttribute('aria-label') || '').trim().slice(0, 80),
+        testid: (el.getAttribute('data-testid') || '').trim(),
+        href: (el.getAttribute('href') || '').trim(),
+      }))
+      .filter((c) => c.text || c.aria || c.testid || c.href);
+    return {
+      url: location.href,
+      controlsSample: controls.slice(0, 30),
+      linksPlaylists: [...new Set([...document.querySelectorAll('a[href*="/playlist/"]')].map((a) => a.getAttribute('href') || '').filter(Boolean))].slice(0, 20),
+    };
+  }).catch(() => ({ url: page.url(), controlsSample: [], linksPlaylists: [] }));
+}
+
 const input = JSON.parse(readFileSync('/tmp/spotify-playlist-input.json', 'utf8'));
 const result = {
   ok: false,
@@ -185,8 +291,7 @@ try {
 
   page = await context.newPage();
   result.phase = 'open_library';
-  await page.goto('https://open.spotify.com/collection/playlists', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(1500);
+  await ensurePlaylistsView(page);
 
   const currentUrl = page.url();
   if (currentUrl.includes('accounts.spotify.com')) {
@@ -203,34 +308,24 @@ try {
   const beforeIds = extractPlaylistIdsFromHrefs(beforeHrefs);
 
   result.phase = 'create_playlist';
-  let created = await clickFirst(page, [
-    'button[aria-label*="Create playlist" i]',
-    'button[aria-label*="Create a playlist" i]',
-    'button[aria-label*="New playlist" i]',
-    '[data-testid*="create-playlist" i]',
-    'button:has-text("Create playlist")',
-    'button:has-text("New playlist")',
-    'button:has-text("Create")',
-  ], 2500);
+  let created = await clickCreatePlaylistHeuristic(page);
   if (!created) {
-    await page.locator('button,[role="button"],a').evaluateAll((els) => {
-      const target = els.find((el) => {
-        const t = (el.textContent || '').trim().toLowerCase();
-        const a = (el.getAttribute('aria-label') || '').toLowerCase();
-        return t === 'create' || a.includes('create playlist') || a.includes('new playlist');
-      });
-      if (target) target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-      return Boolean(target);
-    }).catch(() => false);
-    created = true;
+    // second pass after forcing playlists view again
+    await ensurePlaylistsView(page).catch(() => null);
+    created = await clickCreatePlaylistHeuristic(page);
+  }
+
+  if (!created) {
+    const diag = await collectCreateDiagnostics(page);
+    result.debug = {
+      ...result.debug,
+      createDiagnostics: diag,
+    };
+    throw new Error('Could not click create playlist control');
   }
 
   await page.waitForTimeout(700);
-  await clickFirst(page, [
-    '[role="menuitem"]:has-text("Playlist")',
-    'button:has-text("Playlist")',
-    '[role="button"]:has-text("Playlist")',
-  ], 1500).catch(() => false);
+  await clickPlaylistMenuOption(page).catch(() => false);
 
   let playlistId = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/)?.[1] || null;
   for (let i = 0; i < 18 && !playlistId; i++) {
@@ -259,6 +354,7 @@ try {
       beforePlaylistCount: beforeIds.length,
       beforeSample: beforeIds.slice(0, 6),
       phase: result.phase,
+      ...(await collectCreateDiagnostics(page)),
     };
     throw new Error('Could not navigate to playlist page');
   }
