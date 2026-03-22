@@ -389,10 +389,21 @@ const result = {
   debug: {},
 };
 
+function trace(phase, extra = {}) {
+  try {
+    console.log('SPOTIFY_PW_TRACE=' + JSON.stringify({
+      ts: new Date().toISOString(),
+      phase,
+      ...extra,
+    }));
+  } catch {}
+}
+
 let browser;
 let page;
 ;(async () => {
 try {
+  trace('bootstrap_start');
   let chromium;
   try {
     ({ chromium } = require('playwright'));
@@ -431,6 +442,7 @@ try {
 
   page = await context.newPage();
   result.phase = 'open_library';
+  trace('open_library_start');
   await ensurePlaylistsView(page);
 
   const currentUrl = page.url();
@@ -448,6 +460,7 @@ try {
   const beforeIds = extractPlaylistIdsFromHrefs(beforeHrefs);
 
   result.phase = 'create_playlist';
+  trace('create_playlist_start');
   let created = await clickCreatePlaylistHeuristic(page);
   if (!created) {
     // second pass after forcing playlists view again
@@ -476,6 +489,7 @@ try {
     }
     throw new Error('Could not click create playlist control');
   }
+  trace('create_playlist_clicked');
 
   await page.waitForTimeout(700);
   await clickPlaylistMenuOption(page).catch(() => false);
@@ -520,6 +534,7 @@ try {
     };
     throw new Error('Could not navigate to playlist page');
   }
+  trace('playlist_resolved', { playlistId });
 
   const playlistUrl = 'https://open.spotify.com/playlist/' + playlistId;
   result.phase = 'open_playlist';
@@ -549,6 +564,7 @@ try {
   }
 
   result.phase = 'add_tracks';
+  trace('add_tracks_start', { queryCount: queries.length });
   const queries = (Array.isArray(input.trackQueries) ? input.trackQueries : [])
     .map((q) => String(q || '').trim())
     .filter(Boolean)
@@ -558,13 +574,16 @@ try {
   const trackFailures = [];
   for (const query of queries) {
     try {
+      trace('add_track_query_start', { query });
       await ensureSearchTracksView(page, query);
       await page.waitForTimeout(350);
       const add = await addFirstSearchResultToPlaylist(page, playlistId, playlistName);
       if (add.ok) {
         trackCount++;
+        trace('add_track_query_ok', { query, trackCount, reason: add.reason });
       } else if (trackFailures.length < 8) {
         trackFailures.push({ query, reason: add.reason, url: page.url() });
+        trace('add_track_query_fail', { query, reason: add.reason, url: page.url() });
       }
       await page.waitForTimeout(250);
     } catch (err) {
@@ -576,6 +595,11 @@ try {
           url: page.url(),
         });
       }
+      trace('add_track_query_exception', {
+        query,
+        error: err instanceof Error ? err.message.slice(0, 140) : String(err).slice(0, 140),
+        url: page.url(),
+      });
     }
   }
 
@@ -597,11 +621,14 @@ try {
     throw new Error('No tracks were added to the created playlist');
   }
 
+  trace('add_tracks_done', { trackCount, finalTrackLinks });
+
   result.ok = true;
   result.message = 'ok';
   result.url = playlistUrl;
   result.trackCount = trackCount;
 } catch (err) {
+  trace('fatal', { message: err instanceof Error ? err.message : String(err), phase: result.phase });
   result.ok = false;
   result.message = err instanceof Error ? err.message : String(err);
   result.debug = {

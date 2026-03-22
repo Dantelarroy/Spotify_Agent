@@ -7,7 +7,8 @@ import { getSpotifySession, invalidateSpotifySession } from "@/lib/spotify-sessi
 import { createAgent } from "@/lib/spotify-agent"
 
 export const runtime = "nodejs"
-export const maxDuration = 60
+// Sandbox + Playwright playlist creation can exceed 60s on cold starts.
+export const maxDuration = 300
 
 export async function POST(req: Request) {
   const session = await auth()
