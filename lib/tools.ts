@@ -133,6 +133,11 @@ export function createTools(
           () => agent.createPlaylist(name, description, trackQueries),
           onSessionExpired
         )
+        if (trackQueries.length > 0 && result.trackCount <= 0) {
+          throw new Error(
+            "PLAYLIST_EMPTY: Playlist created but 0 tracks were added. Spotify Web UI automation could not match/add tracks."
+          )
+        }
         return JSON.stringify({
           message: `Creé la playlist "${name}" con ${result.trackCount} temas.`,
           url: result.url,

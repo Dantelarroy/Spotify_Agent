@@ -260,6 +260,37 @@ async function clickPlaylistMenuOption(page) {
   }).catch(() => false);
 }
 
+async function ensureSearchTracksView(page, query) {
+  await page.goto('https://open.spotify.com/search/' + encodeURIComponent(query) + '/tracks', {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000,
+  });
+  await page.waitForTimeout(450);
+
+  if (page.url().includes('/tracks')) return;
+
+  await clickFirst(page, [
+    'a[href*="/tracks"]',
+    '[role="tab"]:has-text("Tracks")',
+    '[role="tab"]:has-text("Songs")',
+    '[role="tab"]:has-text("Canciones")',
+    '[role="tab"]:has-text("Musicas")',
+  ], 1200);
+  await page.waitForTimeout(350);
+}
+
+async function countPlaylistTrackLinks(page, playlistUrl) {
+  await page.goto(playlistUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(900);
+  const total = await page.$$eval('a[href*="/track/"]', (els) => {
+    const ids = els
+      .map((el) => String(el.getAttribute('href') || '').match(/\/track\/([a-zA-Z0-9]+)/)?.[1] || null)
+      .filter(Boolean);
+    return new Set(ids).size;
+  }).catch(() => 0);
+  return Number(total || 0);
+}
+
 async function collectCreateDiagnostics(page) {
   return page.evaluate(() => {
     const controls = [...document.querySelectorAll('button,[role="button"],a')]
@@ -280,7 +311,13 @@ async function collectCreateDiagnostics(page) {
 }
 
 async function addFirstSearchResultToPlaylist(page, playlistId, playlistName) {
-  const row = page.locator('[data-testid="tracklist-row"], [role="row"]').first();
+  const row = page.locator([
+    '[data-testid="tracklist-row"]:has(button[aria-haspopup="menu"])',
+    '[data-testid="tracklist-row"]:has([data-testid="more-button"])',
+    '[data-testid="tracklist-row"]',
+    '[role="row"]:has(button[aria-haspopup="menu"])',
+    '[role="row"]',
+  ].join(',')).first();
   if (!(await row.count())) return { ok: false, reason: 'no_track_row' };
 
   await row.hover({ timeout: 1500 }).catch(() => null);
@@ -465,6 +502,15 @@ try {
   }
 
   if (!playlistId) {
+    // One more deterministic pass from playlists view before failing.
+    await ensurePlaylistsView(page).catch(() => null);
+    await page.waitForTimeout(500);
+    const afterHrefs = await listLibraryPlaylistHrefs(page);
+    const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
+    playlistId = afterIds.find((id) => !beforeIds.includes(id)) || null;
+  }
+
+  if (!playlistId) {
     result.debug = {
       currentUrl: page.url(),
       beforePlaylistCount: beforeIds.length,
@@ -512,11 +558,8 @@ try {
   const trackFailures = [];
   for (const query of queries) {
     try {
-      await page.goto(
-        'https://open.spotify.com/search/' + encodeURIComponent(query) + '/tracks',
-        { waitUntil: 'domcontentloaded', timeout: 60000 }
-      );
-      await page.waitForTimeout(700);
+      await ensureSearchTracksView(page, query);
+      await page.waitForTimeout(350);
       const add = await addFirstSearchResultToPlaylist(page, playlistId, playlistName);
       if (add.ok) {
         trackCount++;
@@ -542,6 +585,16 @@ try {
       trackFailures,
       queryCount: queries.length,
     };
+  }
+
+  const finalTrackLinks = await countPlaylistTrackLinks(page, playlistUrl).catch(() => 0);
+  result.debug = {
+    ...result.debug,
+    finalTrackLinks,
+  };
+
+  if (queries.length > 0 && (trackCount === 0 || finalTrackLinks === 0)) {
+    throw new Error('No tracks were added to the created playlist');
   }
 
   result.ok = true;
