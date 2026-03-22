@@ -965,6 +965,9 @@ export class SpotifyAgent {
     if (msg.includes("Status code 400 is not ok")) return true
     if (msg.includes("Status code 429 is not ok")) return true
     if (msg.includes("Status code 500 is not ok")) return true
+    if (msg.includes("ECONNREFUSED")) return true
+    if (msg.includes("127.0.0.1:9222")) return true
+    if (msg.toLowerCase().includes("timeout")) return true
     return false
   }
 
@@ -1310,19 +1313,36 @@ export class SpotifyAgent {
       const detail = this.describeSandboxError(err)
       throw new Error(`SANDBOX_STEP_FAILED:write-files:${detail}`)
     }
-    // Primera apertura — arranca Chrome con CDP en puerto 9222
-    await this.runSandboxCommand(sandbox, "open-blank", "agent-browser", ["open", "about:blank"], 2)
-    // Inyectar cookies httpOnly via CDP antes de navegar a Spotify
-    const result = await this.runSandboxCommand(
-      sandbox,
-      "inject-cookies",
-      "node",
-      ["/tmp/inject-cookies.mjs"],
-      1
-    )
-    const stderr = await result.stderr()
-    if (stderr) console.log("[sandbox] inject stderr:", stderr.slice(0, 200))
-    console.log("[sandbox] session cookies injected via CDP")
+    let lastErr: unknown = null
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        // Primera apertura — arranca Chrome con CDP en puerto 9222
+        await this.runSandboxCommand(sandbox, "open-blank", "agent-browser", ["open", "about:blank"], 1)
+        await this.sleep(250 * attempt)
+
+        // Warm-up: force a lightweight browser command before CDP injection.
+        await this.runSandboxCommand(sandbox, "warmup-get-url", "agent-browser", ["get", "url", "--json"], 0).catch(() => null)
+
+        // Inyectar cookies httpOnly via CDP antes de navegar a Spotify
+        const result = await this.runSandboxCommand(
+          sandbox,
+          "inject-cookies",
+          "node",
+          ["/tmp/inject-cookies.mjs"],
+          0
+        )
+        const stderr = await result.stderr()
+        if (stderr) console.log("[sandbox] inject stderr:", stderr.slice(0, 200))
+        console.log("[sandbox] session cookies injected via CDP")
+        return
+      } catch (err) {
+        lastErr = err
+        const detail = this.describeSandboxError(err)
+        console.error(`[sandbox] inject attempt ${attempt}/4 failed:`, detail)
+        await this.sleep(350 * attempt)
+      }
+    }
+    throw new Error(`SANDBOX_STEP_FAILED:inject-cookies:${this.describeSandboxError(lastErr)}`)
   }
 
   // ─── agent-browser command helpers ─────────────────────────────────────────
