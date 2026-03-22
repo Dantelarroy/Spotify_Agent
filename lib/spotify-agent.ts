@@ -1501,8 +1501,8 @@ export class SpotifyAgent {
     trackQueries: string[]
   ): Promise<{ url: string; trackCount: number }> {
     return this.withSandbox(async (sandbox) => {
-      console.log("[sandbox] creating playlist via Playwright flow")
-      const created = await this.runPlaywrightPlaylistFlow(sandbox, name, description, trackQueries)
+      console.log("[sandbox] creating playlist via visual agent flow")
+      const created = await this.runVisualPlaylistFlow(sandbox, name, description, trackQueries)
       console.log("[sandbox] playlist created:", created.url, "tracks:", created.trackCount)
       return created
     }, 600_000) // 10 min para playlists grandes
@@ -1558,13 +1558,45 @@ export class SpotifyAgent {
   private async addOneTrack(
     sandbox: Sandbox,
     query: string,
-    playlistName: string
-  ): Promise<boolean> {
+    playlistName: string,
+    playlistId: string,
+    preferredOpenMode?: "row-more" | "right-click" | "keyboard"
+  ): Promise<{ ok: boolean; openMode?: "row-more" | "right-click" | "keyboard"; reason?: string }> {
     await this.agentOpen(
       sandbox,
       `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`
     )
     await this.sleep(800)
+
+    // Fallback to generic search page and select Tracks tab if needed.
+    let hasTrackLink = await this.agentEval(sandbox, `
+      (() => document.querySelectorAll('a[href*="/track/"]').length > 0 ? '1' : '0')()
+    `).catch(() => "0")
+    if (hasTrackLink !== "1") {
+      await this.agentOpen(
+        sandbox,
+        `https://open.spotify.com/search/${encodeURIComponent(query)}`
+      )
+      await this.findAndClick(
+        sandbox,
+        ["Tracks", "Songs", "Canciones", "Músicas", "Musicas"],
+        `
+          (() => {
+            const terms = ['tracks','songs','canciones','músicas','musicas'];
+            const nodes = [...document.querySelectorAll('a,button,[role="tab"]')];
+            const target = nodes.find(el => terms.some(t => (el.textContent || '').toLowerCase().includes(t)));
+            if (!target) return false;
+            target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            return true;
+          })()
+        `
+      )
+      await this.sleep(500)
+      hasTrackLink = await this.agentEval(sandbox, `
+        (() => document.querySelectorAll('a[href*="/track/"]').length > 0 ? '1' : '0')()
+      `).catch(() => "0")
+      if (hasTrackLink !== "1") return { ok: false, reason: "no_track_row" }
+    }
 
     // Hover sobre el primer track row para revelar el botón ⋯
     await this.agentEval(sandbox, `
@@ -1573,33 +1605,107 @@ export class SpotifyAgent {
     `)
     await this.sleep(400)
 
-    // Click ⋯ (More options)
-    const moreClicked = await this.findAndClick(
-      sandbox,
-      ["More options"],
-      `document.querySelector('button[aria-label="More options"], [data-testid="more-button"]')?.click()`
-    )
-    if (!moreClicked) return false
-    await this.sleep(400)
+    const allModes: Array<"row-more" | "right-click" | "keyboard"> = ["row-more", "right-click", "keyboard"]
+    const order: Array<"row-more" | "right-click" | "keyboard"> = preferredOpenMode
+      ? [preferredOpenMode, ...allModes.filter((m) => m !== preferredOpenMode)]
+      : allModes
+    let openMode: "row-more" | "right-click" | "keyboard" | undefined
+    let menuOpened = false
+    for (const mode of order) {
+      if (mode === "row-more") {
+        const moreClicked = await this.findAndClick(
+          sandbox,
+          ["More options", "Más opciones", "Mais opções"],
+          `
+            (() => {
+              const btn = document.querySelector('button[aria-label*="More options" i], [data-testid="more-button"], button[aria-haspopup="menu"]');
+              if (!btn) return false;
+              btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              return true;
+            })()
+          `
+        )
+        if (moreClicked) {
+          menuOpened = true
+          openMode = "row-more"
+          break
+        }
+      }
+      if (mode === "right-click") {
+        const ok = await this.agentEval(sandbox, `
+          (() => {
+            const link = document.querySelector('main a[href*="/track/"], a[href*="/track/"]');
+            if (!link) return false;
+            link.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, button: 2 }));
+            return true;
+          })()
+        `).catch(() => "false")
+        if (ok.includes("true")) {
+          menuOpened = true
+          openMode = "right-click"
+          break
+        }
+      }
+      if (mode === "keyboard") {
+        const ok = await this.agentEval(sandbox, `
+          (() => {
+            const link = document.querySelector('main a[href*="/track/"], a[href*="/track/"]');
+            if (!link) return false;
+            link.focus();
+            link.dispatchEvent(new KeyboardEvent('keydown', { key: 'F10', shiftKey: true, bubbles: true }));
+            return true;
+          })()
+        `).catch(() => "false")
+        if (ok.includes("true")) {
+          menuOpened = true
+          openMode = "keyboard"
+          break
+        }
+      }
+    }
+    if (!menuOpened) return { ok: false, reason: "no_more_button" }
+    await this.sleep(420)
 
     // Click "Add to playlist"
     const addClicked = await this.findAndClick(
       sandbox,
-      ["Add to playlist"],
-      `[...document.querySelectorAll('[role="menuitem"]')].find(el => el.textContent?.includes('Add to playlist'))?.click()`
+      ["Add to playlist", "Añadir a playlist", "Agregar a playlist", "Adicionar à playlist"],
+      `
+        (() => {
+          const terms = ['add to playlist','añadir a playlist','agregar a playlist','add to','añadir','agregar','adicionar'];
+          const item = [...document.querySelectorAll('[role="menuitem"], button, [role="button"]')]
+            .find(el => terms.some(t => (el.textContent || '').toLowerCase().includes(t)));
+          if (!item) return false;
+          item.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          return true;
+        })()
+      `
     )
-    if (!addClicked) return false
+    if (!addClicked) return { ok: false, reason: "no_add_menu_path" }
     await this.sleep(600)
 
-    // Click el nombre de la playlist en el submenú
-    await this.findAndClick(
+    // Click target playlist in submenu by id or name.
+    const clickedPlaylist = await this.findAndClick(
       sandbox,
       [playlistName],
-      `[...document.querySelectorAll('[role="menuitem"], [role="option"]')]
-        .find(el => el.textContent?.includes(${JSON.stringify(playlistName)}))?.click()`
+      `
+        (() => {
+          const byId = document.querySelector('a[href*="/playlist/${playlistId}"]');
+          if (byId) {
+            byId.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            return true;
+          }
+          const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], a, button')];
+          const target = items.find(el => (el.textContent || '').toLowerCase().includes(${JSON.stringify(playlistName.toLowerCase())}));
+          if (!target) return false;
+          target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          return true;
+        })()
+      `
     )
+    if (!clickedPlaylist) return { ok: false, reason: "submenu_without_target_playlist" }
     await this.sleep(400)
-    return true
+    return { ok: true, openMode }
   }
 
   /**
@@ -1607,13 +1713,140 @@ export class SpotifyAgent {
    */
   async playTrack(query: string): Promise<{ name: string; artist: string }> {
     return this.withSandbox(async (sandbox) => {
-      const info = await this.runPlaywrightPlayerControl<{ name: string; artist: string }>(sandbox, {
-        action: "play_track",
-        query,
-      })
-      console.log("[sandbox] playTrack:", info.name, "-", info.artist)
-      return { name: info.name || query, artist: info.artist }
+      await this.injectCookies(sandbox)
+      await this.agentOpen(
+        sandbox,
+        `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`
+      )
+      await this.sleep(700)
+      const clicked = await this.findAndClick(
+        sandbox,
+        ["Play", "Reproducir", "Tocar"],
+        `
+          (() => {
+            const btn = document.querySelector('[data-testid="play-button"], [data-testid="tracklist-row"] [data-testid="play-button"], button[aria-label*="Play" i]');
+            if (btn) {
+              btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              return true;
+            }
+            const link = document.querySelector('a[href*="/track/"]');
+            if (link) {
+              link.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              return true;
+            }
+            return false;
+          })()
+        `
+      )
+      if (!clicked) {
+        throw new Error("PLAYWRIGHT_CONTROL_FAILED:No tracks found on search page")
+      }
+      await this.sleep(500)
+      const now = await this.agentEval(sandbox, `
+        JSON.stringify((() => {
+          const name = (document.querySelector('[data-testid="context-item-link"], [data-testid="nowplaying-track-link"], a[href*="/track/"]')?.textContent || '').trim();
+          const artist = (document.querySelector('[data-testid="context-item-info-artist"], a[href*="/artist/"]')?.textContent || '').trim();
+          return { name, artist };
+        })())
+      `).catch(() => "{}")
+      let parsed: { name?: string; artist?: string } = {}
+      try { parsed = JSON.parse(now) } catch {}
+      console.log("[sandbox] playTrack:", parsed.name || query, "-", parsed.artist || "")
+      return { name: parsed.name || query, artist: parsed.artist || "" }
     })
+  }
+
+  private simplifyTrackQuery(query: string): string[] {
+    const q = String(query || "")
+      .replace(/\([^)]*\)/g, " ")
+      .replace(/\[[^\]]*\]/g, " ")
+      .replace(/\b(live|remaster(?:ed)?|version|mono|stereo|deluxe)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 90)
+    const variants = new Set<string>()
+    if (q) variants.add(q)
+    const base = q.split(/[:|]/)[0]?.trim()
+    if (base && base.length >= 5) variants.add(base)
+    const dash = q.split(/\s-\s| - /)[0]?.trim()
+    if (dash && dash.length >= 5) variants.add(dash)
+    return [...variants].slice(0, 3)
+  }
+
+  private async runVisualPlaylistFlow(
+    sandbox: Sandbox,
+    name: string,
+    _description: string,
+    trackQueries: string[]
+  ): Promise<{ url: string; trackCount: number }> {
+    await this.injectCookies(sandbox)
+    await this.agentOpen(sandbox, "https://open.spotify.com/collection/playlists")
+    const current = await this.agentGetUrl(sandbox)
+    this.assertNotLogin(current)
+
+    const beforeIds = await this.readVisiblePlaylistIds(sandbox)
+    let created = await this.findAndClick(
+      sandbox,
+      ["Create playlist", "Nueva playlist", "Crear playlist", "Create", "New playlist"],
+      `
+        (() => {
+          const terms = ['create playlist','new playlist','crear playlist','nueva playlist','create'];
+          const nodes = [...document.querySelectorAll('button,a,[role="button"]')];
+          const target = nodes.find(el => terms.some(t => ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '') + ' ' + (el.getAttribute('data-testid') || '')).toLowerCase().includes(t)));
+          if (!target) return false;
+          target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          return true;
+        })()
+      `
+    )
+    if (!created) {
+      created = await this.findAndClick(
+        sandbox,
+        ["Playlist", "Lista"],
+        `
+          (() => {
+            const terms = ['playlist','lista'];
+            const nodes = [...document.querySelectorAll('[role="menuitem"],button,[role="button"]')];
+            const target = nodes.find(el => terms.some(t => (el.textContent || '').toLowerCase().includes(t)));
+            if (!target) return false;
+            target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            return true;
+          })()
+        `
+      )
+    }
+    if (!created) throw new Error("PLAYLIST_CREATE_FAILED:Could not click create playlist control")
+
+    await this.sleep(900)
+    const urlAfter = await this.agentGetUrl(sandbox)
+    const playlistUrl = await this.resolvePlaylistUrlAfterCreate(sandbox, urlAfter, beforeIds)
+    if (!playlistUrl) throw new Error("PLAYLIST_CREATE_FAILED:Could not navigate to playlist page")
+    await this.agentOpen(sandbox, playlistUrl)
+    await this.renamePlaylist(sandbox, name)
+
+    const playlistId = this.extractPlaylistId(playlistUrl) || ""
+    let preferredMode: "row-more" | "right-click" | "keyboard" | undefined
+    let added = 0
+    for (const raw of trackQueries.slice(0, 50)) {
+      const variants = this.simplifyTrackQuery(raw)
+      let ok = false
+      for (const variant of variants) {
+        const res = await this.addOneTrack(sandbox, variant, name, playlistId, preferredMode)
+        if (res.ok) {
+          preferredMode = preferredMode ?? res.openMode
+          added++
+          ok = true
+          break
+        }
+      }
+      if (!ok) {
+        console.log("[sandbox] add track failed:", raw)
+      }
+    }
+    if (trackQueries.length > 0 && added === 0) {
+      throw new Error("PLAYLIST_CREATE_FAILED:No tracks were added to the created playlist")
+    }
+    return { url: playlistUrl, trackCount: added }
   }
 
   /**
