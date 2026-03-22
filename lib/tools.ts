@@ -36,6 +36,22 @@ function isBlacklisted(name: string, blacklist: string[]): boolean {
   return blacklist.some((b) => n.includes(normalize(b)))
 }
 
+function compactTrackQuery(name: string, artist: string): string {
+  const cleanArtist = String(artist || "")
+    .replace(/[()[\]{}]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  const cleanName = String(name || "")
+    // remove long/verbose suffixes that hurt Spotify matching
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/\[[^\]]*\]/g, " ")
+    .replace(/\b(live|remaster(ed)?|version|mono|stereo|deluxe)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  const shortTitle = cleanName.split(/[:\-|]/)[0]?.trim() || cleanName
+  return `${cleanArtist} ${shortTitle}`.replace(/\s+/g, " ").trim().slice(0, 90)
+}
+
 async function deezerGet<T>(path: string): Promise<T | null> {
   try {
     const res = await fetch(`${DEEZER_API}${path}`)
@@ -128,7 +144,7 @@ export function createTools(
         const filtered = tracks.filter(
           (t) => !isBlacklisted(t.name, blacklist) && !isBlacklisted(t.artist, blacklist)
         )
-        const trackQueries = filtered.map((t) => `${t.name} ${t.artist}`)
+        const trackQueries = filtered.map((t) => compactTrackQuery(t.name, t.artist))
         const result = await wrapSpotifyCall(
           () => agent.createPlaylist(name, description, trackQueries),
           onSessionExpired

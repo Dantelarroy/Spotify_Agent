@@ -53,6 +53,23 @@ async function ensureSearchTracksView(page, query) {
     throw new Error('SPOTIFY_NOT_CONNECTED: search page is behind login wall');
   }
   await page.waitForSelector('a[href*="/track/"], [data-testid="tracklist-row"]', { timeout: 9000 }).catch(() => null);
+  const hasAny = await page.$$eval('a[href*="/track/"], [data-testid="tracklist-row"]', (els) => els.length).catch(() => 0);
+  if (!hasAny) {
+    await page.goto('https://open.spotify.com/search/' + encodeURIComponent(query), {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    }).catch(() => null);
+    await page.waitForTimeout(500);
+    await clickFirst(page, [
+      'a[href*="/tracks"]',
+      '[role="tab"]:has-text("Tracks")',
+      '[role="tab"]:has-text("Songs")',
+      '[role="tab"]:has-text("Canciones")',
+      '[role="tab"]:has-text("Músicas")',
+      '[role="tab"]:has-text("Musicas")',
+    ], 1200).catch(() => false);
+    await page.waitForTimeout(400);
+  }
 }
 
 async function collectTrackCandidates(page, limit = 20) {

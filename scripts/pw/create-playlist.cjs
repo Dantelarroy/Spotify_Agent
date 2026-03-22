@@ -27,6 +27,27 @@ function hasRequiredCookies(cookies) {
   return names.has('sp_dc') && names.has('sp_key');
 }
 
+function simplifyQuery(raw) {
+  return String(raw || '')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\b(live|remaster(?:ed)?|version|mono|stereo|deluxe)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 90);
+}
+
+function buildQueryVariants(raw) {
+  const q = simplifyQuery(raw);
+  const variants = new Set();
+  if (q) variants.add(q);
+  const noColonTail = q.split(/[:|]/)[0]?.trim();
+  if (noColonTail && noColonTail.length >= 6) variants.add(noColonTail);
+  const noDashTail = q.split(/\s-\s| - /)[0]?.trim();
+  if (noDashTail && noDashTail.length >= 6) variants.add(noDashTail);
+  return [...variants].slice(0, 3);
+}
+
 async function listLibraryPlaylistHrefs(page) {
   return page.$$eval(
     [
@@ -207,6 +228,24 @@ async function ensureSearchTracksView(page, query) {
     throw new Error('SPOTIFY_NOT_CONNECTED: search page is behind login wall');
   }
   await page.waitForSelector('a[href*="/track/"], [data-testid="tracklist-row"]', { timeout: 9000 }).catch(() => null);
+  // Fallback route layout variant.
+  const hasAny = await page.$$eval('a[href*="/track/"], [data-testid="tracklist-row"]', (els) => els.length).catch(() => 0);
+  if (!hasAny) {
+    await page.goto('https://open.spotify.com/search/' + encodeURIComponent(query), {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    }).catch(() => null);
+    await page.waitForTimeout(500);
+    await clickFirst(page, [
+      'a[href*="/tracks"]',
+      '[role="tab"]:has-text("Tracks")',
+      '[role="tab"]:has-text("Songs")',
+      '[role="tab"]:has-text("Canciones")',
+      '[role="tab"]:has-text("Músicas")',
+      '[role="tab"]:has-text("Musicas")',
+    ], 1200).catch(() => false);
+    await page.waitForTimeout(400);
+  }
 }
 
 async function collectTrackCandidates(page, limit = 20) {
@@ -546,16 +585,25 @@ try {
   const trackFailures = [];
   for (const query of queries) {
     try {
-      trace('add_track_query_start', { query });
-      await ensureSearchTracksView(page, query);
-      await page.waitForTimeout(350);
-      const add = await addFirstSearchResultToPlaylist(page, playlistId, playlistName);
-      if (add.ok) {
-        trackCount++;
-        trace('add_track_query_ok', { query, trackCount, reason: add.reason });
-      } else if (trackFailures.length < 8) {
-        trackFailures.push({ query, reason: add.reason, url: page.url() });
-        trace('add_track_query_fail', { query, reason: add.reason, url: page.url() });
+      const variants = buildQueryVariants(query);
+      trace('add_track_query_start', { query, variants });
+      let added = false;
+      let lastReason = 'no_variant_succeeded';
+      for (const variant of variants) {
+        await ensureSearchTracksView(page, variant);
+        await page.waitForTimeout(350);
+        const add = await addFirstSearchResultToPlaylist(page, playlistId, playlistName);
+        if (add.ok) {
+          trackCount++;
+          added = true;
+          trace('add_track_query_ok', { query, variant, trackCount, reason: add.reason });
+          break;
+        }
+        lastReason = add.reason || lastReason;
+      }
+      if (!added && trackFailures.length < 8) {
+        trackFailures.push({ query, reason: lastReason, url: page.url() });
+        trace('add_track_query_fail', { query, reason: lastReason, url: page.url() });
       }
       await page.waitForTimeout(250);
     } catch (err) {
