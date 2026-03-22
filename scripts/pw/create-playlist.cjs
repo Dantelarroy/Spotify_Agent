@@ -317,7 +317,7 @@ async function collectCreateDiagnostics(page) {
   }).catch(() => ({ url: page.url(), controlsSample: [], linksPlaylists: [] }));
 }
 
-async function addFirstSearchResultToPlaylist(page, playlistId, playlistName) {
+async function addFirstSearchResultToPlaylist(page, playlistId, playlistName, preferredOpenMode) {
   const row = page.locator([
     '[data-testid="tracklist-row"]:has(button[aria-haspopup="menu"])',
     '[data-testid="tracklist-row"]:has([data-testid="more-button"])',
@@ -331,26 +331,38 @@ async function addFirstSearchResultToPlaylist(page, playlistId, playlistName) {
   const hasTrackLink = await firstTrackLink.count();
   if (!hasRow && !hasTrackLink) return { ok: false, reason: 'no_track_row' };
 
+  const openModes = [];
+  if (preferredOpenMode) openModes.push(preferredOpenMode);
+  for (const mode of ['row_more', 'right_click', 'shift_f10']) {
+    if (!openModes.includes(mode)) openModes.push(mode);
+  }
+
   let menuOpened = false;
-  if (hasRow) {
-    await row.hover({ timeout: 1500 }).catch(() => null);
-    const more = row.locator('button[aria-label*="More options" i], [data-testid="more-button"], button[aria-haspopup="menu"]').first();
-    if (await more.count()) {
-      await more.click({ timeout: 1800 }).catch(() => null);
-      await page.waitForTimeout(220);
-      menuOpened = true;
+  let openModeUsed = null;
+  for (const mode of openModes) {
+    if (mode === 'row_more' && hasRow && !menuOpened) {
+      await row.hover({ timeout: 1500 }).catch(() => null);
+      const more = row.locator('button[aria-label*="More options" i], [data-testid="more-button"], button[aria-haspopup="menu"]').first();
+      if (await more.count()) {
+        await more.click({ timeout: 1800 }).catch(() => null);
+        await page.waitForTimeout(220);
+        menuOpened = true;
+        openModeUsed = 'row_more';
+      }
     }
-  }
-  if (!menuOpened && hasTrackLink) {
-    await firstTrackLink.click({ button: 'right', timeout: 1800 }).catch(() => null);
-    await page.waitForTimeout(260);
-    menuOpened = await page.locator('[role="menu"], [role="menuitem"]').count().then((c) => c > 0).catch(() => false);
-  }
-  if (!menuOpened && hasTrackLink) {
-    await firstTrackLink.focus().catch(() => null);
-    await page.keyboard.press('Shift+F10').catch(() => null);
-    await page.waitForTimeout(260);
-    menuOpened = await page.locator('[role="menu"], [role="menuitem"]').count().then((c) => c > 0).catch(() => false);
+    if (mode === 'right_click' && hasTrackLink && !menuOpened) {
+      await firstTrackLink.click({ button: 'right', timeout: 1800 }).catch(() => null);
+      await page.waitForTimeout(260);
+      menuOpened = await page.locator('[role="menu"], [role="menuitem"]').count().then((c) => c > 0).catch(() => false);
+      if (menuOpened) openModeUsed = 'right_click';
+    }
+    if (mode === 'shift_f10' && hasTrackLink && !menuOpened) {
+      await firstTrackLink.focus().catch(() => null);
+      await page.keyboard.press('Shift+F10').catch(() => null);
+      await page.waitForTimeout(260);
+      menuOpened = await page.locator('[role="menu"], [role="menuitem"]').count().then((c) => c > 0).catch(() => false);
+      if (menuOpened) openModeUsed = 'shift_f10';
+    }
   }
   if (!menuOpened) return { ok: false, reason: 'no_more_button' };
 
@@ -358,7 +370,7 @@ async function addFirstSearchResultToPlaylist(page, playlistId, playlistName) {
   const directById = page.locator('a[href*="/playlist/' + playlistId + '"]').first();
   if (await directById.count()) {
     await directById.click({ timeout: 1800 }).catch(() => null);
-    return { ok: true, reason: 'clicked_direct_id' };
+    return { ok: true, reason: 'clicked_direct_id', strategy: { openMode: openModeUsed || preferredOpenMode || null } };
   }
 
   // Strategy B: open/hover likely "Add to playlist" menuitem (language agnostic).
@@ -393,7 +405,7 @@ async function addFirstSearchResultToPlaylist(page, playlistId, playlistName) {
     const byId = page.locator('a[href*="/playlist/' + playlistId + '"], [role="menuitem"] a[href*="/playlist/' + playlistId + '"]').first();
     if (await byId.count()) {
       await byId.click({ timeout: 1800 }).catch(() => null);
-      return { ok: true, reason: 'clicked_submenu_id' };
+      return { ok: true, reason: 'clicked_submenu_id', strategy: { openMode: openModeUsed || preferredOpenMode || null } };
     }
   }
 
@@ -407,7 +419,7 @@ async function addFirstSearchResultToPlaylist(page, playlistId, playlistName) {
     if (!txt) continue;
     if (txt.includes(normalized) || normalized.includes(txt)) {
       await opt.click({ timeout: 1800 }).catch(() => null);
-      return { ok: true, reason: 'clicked_name_match' };
+      return { ok: true, reason: 'clicked_name_match', strategy: { openMode: openModeUsed || preferredOpenMode || null } };
     }
   }
 
@@ -642,6 +654,7 @@ try {
   trace('add_tracks_start', { queryCount: queries.length });
 
   let trackCount = 0;
+  let preferredAddOpenMode = null;
   const trackFailures = [];
   for (const query of queries) {
     try {
@@ -652,11 +665,20 @@ try {
       for (const variant of variants) {
         await ensureSearchTracksView(page, variant);
         await page.waitForTimeout(350);
-        const add = await addFirstSearchResultToPlaylist(page, playlistId, playlistName);
+        const add = await addFirstSearchResultToPlaylist(page, playlistId, playlistName, preferredAddOpenMode);
         if (add.ok) {
           trackCount++;
+          if (!preferredAddOpenMode && add.strategy?.openMode) {
+            preferredAddOpenMode = add.strategy.openMode;
+          }
           added = true;
-          trace('add_track_query_ok', { query, variant, trackCount, reason: add.reason });
+          trace('add_track_query_ok', {
+            query,
+            variant,
+            trackCount,
+            reason: add.reason,
+            openMode: add.strategy?.openMode || preferredAddOpenMode || null,
+          });
           break;
         }
         lastReason = add.reason || lastReason;
