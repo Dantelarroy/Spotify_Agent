@@ -686,6 +686,178 @@ try {
 });
 `.trim()
 
+const PLAYWRIGHT_PLAYER_CONTROL_CJS = String.raw`
+const { readFileSync, writeFileSync } = require('node:fs');
+
+function normalizeText(s) {
+  return String(s || '').toLowerCase().trim();
+}
+
+async function clickFirst(page, selectors, timeout = 1600) {
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    try {
+      if (await locator.count()) {
+        await locator.click({ timeout });
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+
+async function ensureSearchTracksView(page, query) {
+  await page.goto('https://open.spotify.com/search/' + encodeURIComponent(query) + '/tracks', {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000,
+  });
+  await page.waitForTimeout(450);
+  if (page.url().includes('/tracks')) return;
+  await clickFirst(page, [
+    'a[href*="/tracks"]',
+    '[role="tab"]:has-text("Tracks")',
+    '[role="tab"]:has-text("Songs")',
+    '[role="tab"]:has-text("Canciones")',
+    '[role="tab"]:has-text("Musicas")',
+  ], 1200);
+  await page.waitForTimeout(350);
+}
+
+const input = JSON.parse(readFileSync('/tmp/spotify-control-input.json', 'utf8'));
+const result = { ok: false, message: '', data: null, debug: {} };
+
+let browser;
+let page;
+;(async () => {
+  try {
+    let chromium;
+    try {
+      ({ chromium } = require('playwright'));
+    } catch (err) {
+      const root = process.env.PLAYWRIGHT_NODE_MODULES || '';
+      if (!root) throw err;
+      try {
+        ({ chromium } = require(root + '/playwright'));
+      } catch {
+        ({ chromium } = require(root + '/playwright-core'));
+      }
+    }
+
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+    const context = await browser.newContext();
+    const cookies = (Array.isArray(input.cookies) ? input.cookies : []).filter((c) => c?.name && c?.value);
+    if (cookies.length) await context.addCookies(cookies);
+    page = await context.newPage();
+
+    await page.goto('https://open.spotify.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(1200);
+    if (page.url().includes('accounts.spotify.com')) {
+      throw new Error('SPOTIFY_NOT_CONNECTED: redirected to login');
+    }
+
+    const action = String(input.action || '');
+    if (action === 'search_tracks') {
+      const limit = Math.max(1, Math.min(20, Number(input.limit || 10)));
+      const query = String(input.query || '');
+      await ensureSearchTracksView(page, query);
+      const tracks = await page.$$eval('[data-testid="tracklist-row"], [role="row"]', (rows, cap) => {
+        const out = [];
+        const seen = new Set();
+        for (const row of rows) {
+          const link = row.querySelector('a[href^="/track/"]');
+          if (!link) continue;
+          const href = link.getAttribute('href') || '';
+          const m = href.match(/\/track\/([a-zA-Z0-9]+)/);
+          if (!m) continue;
+          const id = m[1];
+          if (seen.has(id)) continue;
+          seen.add(id);
+          const name = (link.textContent || '').trim();
+          const artist = (row.querySelector('a[href^="/artist/"]')?.textContent || '').trim();
+          if (!name) continue;
+          out.push({ name, artist, uri: 'spotify:track:' + id });
+          if (out.length >= cap) break;
+        }
+        return out;
+      }, limit).catch(() => []);
+      result.ok = true;
+      result.data = tracks;
+    } else if (action === 'play_track') {
+      const query = String(input.query || '');
+      await ensureSearchTracksView(page, query);
+      const row = page.locator('[data-testid="tracklist-row"], [role="row"]').first();
+      if (!(await row.count())) throw new Error('No track rows found');
+      const info = await row.evaluate((el) => {
+        const name = (el.querySelector('a[href^="/track/"]')?.textContent || '').trim();
+        const artist = (el.querySelector('a[href^="/artist/"]')?.textContent || '').trim();
+        return { name, artist };
+      }).catch(() => ({ name: '', artist: '' }));
+      await row.hover({ timeout: 1200 }).catch(() => null);
+      const clicked = await clickFirst(page, [
+        '[data-testid="tracklist-row"] [data-testid="play-button"]',
+        '[data-testid="tracklist-row"] button[aria-label*="Play" i]',
+        'button[aria-label*="Play" i]',
+      ], 1400);
+      if (!clicked) throw new Error('Could not click play control');
+      result.ok = true;
+      result.data = { name: info.name || query, artist: info.artist || '' };
+    } else if (action === 'pause_playback') {
+      const clicked = await clickFirst(page, ['[data-testid="control-button-playpause"]', 'button[aria-label*="Pause" i]', 'button[aria-label*="Play" i]'], 1400);
+      if (!clicked) throw new Error('Could not toggle play/pause');
+      result.ok = true;
+      result.data = { ok: true };
+    } else if (action === 'skip_next') {
+      const clicked = await clickFirst(page, ['[data-testid="control-button-skip-forward"]', 'button[aria-label*="Next" i]'], 1400);
+      if (!clicked) throw new Error('Could not click next');
+      result.ok = true;
+      result.data = { ok: true };
+    } else if (action === 'now_playing') {
+      const now = await page.evaluate(() => {
+        const candidates = [
+          '[data-testid="context-item-link"]',
+          '[data-testid="nowplaying-track-link"]',
+          'a[href*="/track/"]',
+        ];
+        let name = '';
+        for (const sel of candidates) {
+          const txt = (document.querySelector(sel)?.textContent || '').trim();
+          if (txt) { name = txt; break; }
+        }
+        const artist = (document.querySelector('[data-testid="context-item-info-artist"]')?.textContent || '').trim();
+        return name ? { name, artist } : null;
+      }).catch(() => null);
+      result.ok = true;
+      result.data = now;
+    } else {
+      throw new Error('Unknown action: ' + action);
+    }
+  } catch (err) {
+    result.ok = false;
+    result.message = err instanceof Error ? err.message : String(err);
+    result.debug = {
+      currentUrl: page ? page.url() : null,
+      action: input?.action || null,
+    };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    try { writeFileSync('/tmp/spotify-control-result.json', JSON.stringify(result), 'utf8'); } catch {}
+    try { console.log('SPOTIFY_PW_CONTROL_RESULT=' + JSON.stringify(result)); } catch {}
+  }
+})().catch((err) => {
+  const fatal = {
+    ok: false,
+    message: err instanceof Error ? err.message : String(err),
+    data: null,
+    debug: { phase: 'bootstrap' },
+  };
+  try { writeFileSync('/tmp/spotify-control-result.json', JSON.stringify(fatal), 'utf8'); } catch {}
+  try { console.log('SPOTIFY_PW_CONTROL_RESULT=' + JSON.stringify(fatal)); } catch {}
+});
+`.trim()
+
 // Dependencias del sistema para Chromium en Fedora (runtime Vercel Sandbox)
 const CHROMIUM_DEPS = [
   "nss", "nspr", "libxkbcommon", "atk", "at-spi2-atk", "at-spi2-core",
@@ -995,6 +1167,69 @@ export class SpotifyAgent {
     }
   }
 
+  private async runPlaywrightPlayerControl<T>(sandbox: Sandbox, input: Record<string, unknown>): Promise<T> {
+    await this.ensurePlaywrightReady(sandbox)
+    await sandbox.writeFiles([
+      { path: "/tmp/spotify-control-input.json", content: Buffer.from(JSON.stringify({ ...input, cookies: this.cookies })) },
+      { path: "/tmp/pw-player-control.cjs", content: Buffer.from(PLAYWRIGHT_PLAYER_CONTROL_CJS) },
+    ])
+
+    await this.runSandboxCommand(
+      sandbox,
+      "playwright-control-script-check",
+      "node",
+      ["--check", "/tmp/pw-player-control.cjs"],
+      0
+    ).catch((err) => {
+      throw new Error(`PLAYWRIGHT_CONTROL_FAILED:script-check:${this.describeSandboxError(err)}`)
+    })
+
+    const run = await this.runSandboxCommand(
+      sandbox,
+      "playwright-player-control",
+      "sh",
+      [
+        "-lc",
+        "export PLAYWRIGHT_NODE_MODULES=/tmp/pw-runtime/node_modules PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-runtime/ms-playwright; node /tmp/pw-player-control.cjs || true",
+      ],
+      0
+    )
+    const stdout = await run.stdout()
+    const stderr = await run.stderr()
+    const merged = [stdout, stderr].join("\n")
+    const marker = "SPOTIFY_PW_CONTROL_RESULT="
+    const line = merged
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l.startsWith(marker))
+
+    let parsed: { ok: boolean; message?: string; data?: unknown; debug?: unknown } | null = null
+    if (line) {
+      parsed = JSON.parse(line.slice(marker.length))
+    } else {
+      const fallback = await this.runSandboxCommand(
+        sandbox,
+        "read-playwright-control-result-file",
+        "sh",
+        ["-lc", "cat /tmp/spotify-control-result.json 2>/dev/null || true"],
+        0
+      )
+      const raw = (await fallback.stdout()).trim()
+      if (raw) {
+        try { parsed = JSON.parse(raw) } catch { parsed = null }
+      }
+    }
+
+    if (!parsed) {
+      throw new Error(`PLAYWRIGHT_CONTROL_FAILED:missing-result:${merged.slice(-600)}`)
+    }
+    if (!parsed.ok) {
+      const detail = parsed.debug ? ` debug=${JSON.stringify(parsed.debug).slice(0, 500)}` : ""
+      throw new Error(`PLAYWRIGHT_CONTROL_FAILED:${parsed.message ?? "unknown"}${detail}`)
+    }
+    return (parsed.data as T)
+  }
+
   // ─── Cookie injection via CDP ───────────────────────────────────────────────
 
   private async injectCookies(sandbox: Sandbox): Promise<void> {
@@ -1178,35 +1413,13 @@ export class SpotifyAgent {
     limit = 10
   ): Promise<Array<{ name: string; artist: string; uri: string }>> {
     return this.withSandbox(async (sandbox) => {
-      await this.injectCookies(sandbox)
-      await this.agentOpen(
+      const tracks = await this.runPlaywrightPlayerControl<Array<{ name: string; artist: string; uri: string }>>(
         sandbox,
-        `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`
+        { action: "search_tracks", query, limit }
       )
-      this.assertNotLogin(await this.agentGetUrl(sandbox))
-
-      const json = await this.agentEval(sandbox, `
-        JSON.stringify((() => {
-          const seen = new Set(), results = [];
-          for (const a of document.querySelectorAll('a[href^="/track/"]')) {
-            const id = a.getAttribute('href').replace('/track/','').split('?')[0];
-            if (!id || seen.has(id)) continue; seen.add(id);
-            const name = a.textContent?.trim(); if (!name) continue;
-            const row = a.closest('[data-testid="tracklist-row"]')
-                     ?? a.closest('[role="row"]')
-                     ?? a.parentElement?.parentElement;
-            const artist = row?.querySelector('a[href^="/artist/"]')?.textContent?.trim() ?? '';
-            results.push({ name, artist, uri: 'spotify:track:' + id });
-            if (results.length >= ${limit}) break;
-          }
-          return results;
-        })())
-      `)
-
-      try {
-        return (JSON.parse(json) as Array<{ name: string; artist: string; uri: string }>)
-          .filter(t => t.name && t.uri.startsWith("spotify:track:"))
-      } catch { return [] }
+      return Array.isArray(tracks)
+        ? tracks.filter((t) => t?.name && String(t?.uri || "").startsWith("spotify:track:"))
+        : []
     })
   }
 
@@ -1326,42 +1539,10 @@ export class SpotifyAgent {
    */
   async playTrack(query: string): Promise<{ name: string; artist: string }> {
     return this.withSandbox(async (sandbox) => {
-      await this.injectCookies(sandbox)
-      // Cargar homepage para inicializar el Web Player como dispositivo activo
-      await this.agentOpen(sandbox, "https://open.spotify.com")
-      await this.sleep(2000)
-
-      await this.agentOpen(
-        sandbox,
-        `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`
-      )
-      this.assertNotLogin(await this.agentGetUrl(sandbox))
-      await this.sleep(800)
-
-      // Extraer info del primer track via DOM (sin AI)
-      const infoJson = await this.agentEval(sandbox, `
-        JSON.stringify((() => {
-          const row = document.querySelector('[data-testid="tracklist-row"]');
-          return {
-            name: row?.querySelector('a[href^="/track/"]')?.textContent?.trim() ?? '',
-            artist: row?.querySelector('a[href^="/artist/"]')?.textContent?.trim() ?? '',
-          };
-        })())
-      `)
-      const info = JSON.parse(infoJson) as { name: string; artist: string }
-
-      // Hover + click play button
-      await this.agentEval(sandbox, `
-        document.querySelector('[data-testid="tracklist-row"]')
-          ?.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
-      `)
-      await this.sleep(400)
-      await this.findAndClick(
-        sandbox,
-        ["Play"],
-        `document.querySelector('[data-testid="play-button"], button[aria-label*="Play" i]')?.click()`
-      )
-
+      const info = await this.runPlaywrightPlayerControl<{ name: string; artist: string }>(sandbox, {
+        action: "play_track",
+        query,
+      })
       console.log("[sandbox] playTrack:", info.name, "-", info.artist)
       return { name: info.name || query, artist: info.artist }
     })
@@ -1372,15 +1553,7 @@ export class SpotifyAgent {
    */
   async pausePlayback(): Promise<void> {
     return this.withSandbox(async (sandbox) => {
-      await this.injectCookies(sandbox)
-      await this.agentOpen(sandbox, "https://open.spotify.com")
-      await this.sleep(2500)
-
-      await this.findAndClick(
-        sandbox,
-        ["Pause", "Play"],
-        `document.querySelector('[data-testid="control-button-playpause"]')?.click()`
-      )
+      await this.runPlaywrightPlayerControl<{ ok: boolean }>(sandbox, { action: "pause_playback" })
       console.log("[sandbox] pausePlayback toggled")
     })
   }
@@ -1390,15 +1563,7 @@ export class SpotifyAgent {
    */
   async skipToNext(): Promise<void> {
     return this.withSandbox(async (sandbox) => {
-      await this.injectCookies(sandbox)
-      await this.agentOpen(sandbox, "https://open.spotify.com")
-      await this.sleep(2500)
-
-      await this.findAndClick(
-        sandbox,
-        ["Next", "Skip to next"],
-        `document.querySelector('[data-testid="control-button-skip-forward"]')?.click()`
-      )
+      await this.runPlaywrightPlayerControl<{ ok: boolean }>(sandbox, { action: "skip_next" })
       console.log("[sandbox] skipToNext clicked")
     })
   }
@@ -1408,18 +1573,11 @@ export class SpotifyAgent {
    */
   async getNowPlaying(): Promise<{ name: string; artist: string } | null> {
     return this.withSandbox(async (sandbox) => {
-      await this.injectCookies(sandbox)
-      await this.agentOpen(sandbox, "https://open.spotify.com")
-      await this.sleep(2500)
-
-      const json = await this.agentEval(sandbox, `
-        JSON.stringify((() => {
-          const track = document.querySelector('[data-testid="context-item-link"]')?.textContent?.trim();
-          const artist = document.querySelector('[data-testid="context-item-info-artist"]')?.textContent?.trim();
-          return track ? { name: track, artist: artist ?? '' } : null;
-        })())
-      `)
-      try { return JSON.parse(json) } catch { return null }
+      const now = await this.runPlaywrightPlayerControl<{ name: string; artist: string } | null>(
+        sandbox,
+        { action: "now_playing" }
+      )
+      return now
     })
   }
 
