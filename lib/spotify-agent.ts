@@ -874,13 +874,53 @@ export class SpotifyAgent {
       { path: "/tmp/pw-create-playlist.cjs", content: Buffer.from(PLAYWRIGHT_CREATE_PLAYLIST_CJS) },
     ])
 
+    // Detect JS syntax/runtime bootstrap issues early with actionable stderr.
+    const syntaxCheck = await this.runSandboxCommand(
+      sandbox,
+      "playwright-script-syntax-check",
+      "node",
+      ["--check", "/tmp/pw-create-playlist.cjs"],
+      0
+    ).catch(async (err) => {
+      const detail = this.describeSandboxError(err)
+      throw new Error(`PLAYLIST_CREATE_FAILED:Playwright script check failed: ${detail}`)
+    })
+    const syntaxStderr = await syntaxCheck.stderr().catch(() => "")
+    if (syntaxStderr?.trim()) {
+      throw new Error(
+        `PLAYLIST_CREATE_FAILED:Playwright script check failed: ${syntaxStderr.slice(0, 700)}`
+      )
+    }
+
+    const runner = `
+      const fs = require('node:fs');
+      try {
+        require('/tmp/pw-create-playlist.cjs');
+      } catch (err) {
+        const fatal = {
+          ok: false,
+          message: 'bootstrap:' + (err && err.message ? err.message : String(err)),
+          url: null,
+          trackCount: 0,
+          phase: 'bootstrap',
+          debug: {
+            stack: err && err.stack ? String(err.stack).slice(0, 1200) : null,
+          },
+        };
+        try { fs.writeFileSync('/tmp/spotify-pw-result.json', JSON.stringify(fatal), 'utf8'); } catch {}
+        try { console.log('SPOTIFY_PW_RESULT=' + JSON.stringify(fatal)); } catch {}
+        process.exit(0);
+      }
+    `.trim()
+    await sandbox.writeFiles([{ path: "/tmp/pw-runner.cjs", content: Buffer.from(runner) }])
+
     const run = await this.runSandboxCommand(
       sandbox,
       "playwright-create-playlist",
       "sh",
       [
         "-lc",
-        "export PLAYWRIGHT_NODE_MODULES=/tmp/pw-runtime/node_modules PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-runtime/ms-playwright; node /tmp/pw-create-playlist.cjs || true",
+        "export PLAYWRIGHT_NODE_MODULES=/tmp/pw-runtime/node_modules PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-runtime/ms-playwright; node /tmp/pw-runner.cjs || true",
       ],
       0
     )
