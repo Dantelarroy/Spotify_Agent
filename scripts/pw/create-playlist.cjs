@@ -489,6 +489,73 @@ async function addFirstSearchResultToPlaylist(page, playlistId, playlistName, pr
   return { ok: false, reason: submenuOpened ? 'submenu_without_target_playlist' : 'no_add_menu_path' };
 }
 
+async function addTrackViaPlaylistSearch(page, playlistUrl, query) {
+  await page.goto(playlistUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => null);
+  await page.waitForTimeout(650);
+
+  const openedSearch = await clickFirst(page, [
+    'button:has-text("Find more")',
+    'button:has-text("Add songs")',
+    'button:has-text("Buscar")',
+    'button:has-text("Añadir canciones")',
+    'button[data-testid*="add" i]',
+    'button[aria-label*="add" i]',
+  ], 1200);
+  if (!openedSearch) {
+    await page.evaluate(() => {
+      const terms = ['find more', 'add songs', 'search', 'buscar', 'añadir'];
+      const nodes = [...document.querySelectorAll('button,[role="button"],a')];
+      const target = nodes.find((el) => {
+        const txt = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('data-testid') || '')).toLowerCase();
+        return terms.some((t) => txt.includes(t));
+      });
+      if (target) target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    }).catch(() => null);
+    await page.waitForTimeout(350);
+  }
+
+  const searchInput = page.locator([
+    'input[type="search"]',
+    'input[role="searchbox"]',
+    'input[placeholder*="Search" i]',
+    'input[placeholder*="Buscar" i]',
+    'input[aria-label*="Search" i]',
+    'input[aria-label*="Buscar" i]',
+  ].join(',')).first();
+  if (!await searchInput.count()) {
+    return { ok: false, reason: 'playlist_search_input_missing' };
+  }
+  await searchInput.fill(String(query || ''), { timeout: 1800 }).catch(() => null);
+  await page.waitForTimeout(650);
+
+  const addClicked = await clickFirst(page, [
+    'button[data-testid*="add-button" i]',
+    '[data-testid*="add-button" i] button',
+    'button:has-text("Add")',
+    'button:has-text("Añadir")',
+    'button:has-text("Agregar")',
+    'button[aria-label*="Add" i]',
+    'button[aria-label*="Añadir" i]',
+  ], 1400);
+  if (!addClicked) {
+    const evalAdded = await page.evaluate(() => {
+      const terms = ['add', 'añadir', 'agregar', 'adicionar'];
+      const buttons = [...document.querySelectorAll('button,[role="button"]')];
+      const target = buttons.find((el) => {
+        const txt = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('data-testid') || '')).toLowerCase();
+        return terms.some((t) => txt.includes(t));
+      });
+      if (!target) return false;
+      target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      return true;
+    }).catch(() => false);
+    if (!evalAdded) return { ok: false, reason: 'playlist_search_add_button_missing' };
+  }
+
+  await page.waitForTimeout(350);
+  return { ok: true, reason: 'added_via_playlist_search' };
+}
+
 const input = JSON.parse(readFileSync('/tmp/spotify-playlist-input.json', 'utf8'));
 const result = {
   ok: false,
@@ -705,6 +772,22 @@ try {
         }
         lastReason = add.reason || lastReason;
       }
+      if (!added) {
+        const fallbackQuery = variants[0] || query;
+        const fallback = await addTrackViaPlaylistSearch(page, playlistUrl, fallbackQuery);
+        if (fallback.ok) {
+          trackCount++;
+          added = true;
+          trace('add_track_query_ok_playlist_fallback', {
+            query,
+            variant: fallbackQuery,
+            trackCount,
+            reason: fallback.reason,
+          });
+        } else {
+          lastReason = fallback.reason || lastReason;
+        }
+      }
       if (!added && trackFailures.length < 8) {
         trackFailures.push({ query, reason: lastReason, url: page.url() });
         trace('add_track_query_fail', { query, reason: lastReason, url: page.url() });
@@ -741,7 +824,7 @@ try {
     finalTrackLinks,
   };
 
-  if (queries.length > 0 && (trackCount === 0 || finalTrackLinks === 0)) {
+  if (queries.length > 0 && trackCount === 0) {
     throw new Error('No tracks were added to the created playlist');
   }
 

@@ -1521,8 +1521,10 @@ export class SpotifyAgent {
     trackQueries: string[]
   ): Promise<{ url: string; trackCount: number }> {
     return this.withSandbox(async (sandbox) => {
-      console.log("[sandbox] creating playlist via visual agent flow")
-      const created = await this.runVisualPlaylistFlow(sandbox, name, description, trackQueries)
+      // Production path: Playwright maneja cookies via context.addCookies.
+      // Evita depender de CDP localhost:9222, que puede no estar expuesto en cada VM.
+      console.log("[sandbox] creating playlist via playwright flow")
+      const created = await this.runPlaywrightPlaylistFlow(sandbox, name, description, trackQueries)
       console.log("[sandbox] playlist created:", created.url, "tracks:", created.trackCount)
       return created
     }, 600_000) // 10 min para playlists grandes
@@ -1733,44 +1735,10 @@ export class SpotifyAgent {
    */
   async playTrack(query: string): Promise<{ name: string; artist: string }> {
     return this.withSandbox(async (sandbox) => {
-      await this.injectCookies(sandbox)
-      await this.agentOpen(
+      const parsed = await this.runPlaywrightPlayerControl<{ name?: string; artist?: string }>(
         sandbox,
-        `https://open.spotify.com/search/${encodeURIComponent(query)}/tracks`
+        { action: "play_track", query }
       )
-      await this.sleep(700)
-      const clicked = await this.findAndClick(
-        sandbox,
-        ["Play", "Reproducir", "Tocar"],
-        `
-          (() => {
-            const btn = document.querySelector('[data-testid="play-button"], [data-testid="tracklist-row"] [data-testid="play-button"], button[aria-label*="Play" i]');
-            if (btn) {
-              btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-              return true;
-            }
-            const link = document.querySelector('a[href*="/track/"]');
-            if (link) {
-              link.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-              return true;
-            }
-            return false;
-          })()
-        `
-      )
-      if (!clicked) {
-        throw new Error("PLAYWRIGHT_CONTROL_FAILED:No tracks found on search page")
-      }
-      await this.sleep(500)
-      const now = await this.agentEval(sandbox, `
-        JSON.stringify((() => {
-          const name = (document.querySelector('[data-testid="context-item-link"], [data-testid="nowplaying-track-link"], a[href*="/track/"]')?.textContent || '').trim();
-          const artist = (document.querySelector('[data-testid="context-item-info-artist"], a[href*="/artist/"]')?.textContent || '').trim();
-          return { name, artist };
-        })())
-      `).catch(() => "{}")
-      let parsed: { name?: string; artist?: string } = {}
-      try { parsed = JSON.parse(now) } catch {}
       console.log("[sandbox] playTrack:", parsed.name || query, "-", parsed.artist || "")
       return { name: parsed.name || query, artist: parsed.artist || "" }
     })

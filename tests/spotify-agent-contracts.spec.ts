@@ -7,10 +7,10 @@ import { resolve } from "path"
  *
  * Arquitectura exigida:
  *   - Vercel Sandbox (@vercel/sandbox) para microVM efímero
- *   - agent-browser CLI (Rust/CDP) como browser dentro del VM
- *   - Cookies inyectadas via CDP (Network.setCookies) — no Playwright
- *   - AX tree snapshot → click @ref, con fallback a eval JS
- *   - Sin screenshots, sin Claude Haiku, sin Playwright
+ *   - Playwright dentro del VM para flujo robusto E2E
+ *   - Session bootstrap con cookies (sp_dc + sp_key) via context.addCookies
+ *   - Sin API oficial de Spotify
+ *   - Sin screenshots con modelos de visión
  */
 
 // ─── Arquitectura: Vercel Sandbox ────────────────────────────────────────────
@@ -40,16 +40,18 @@ test("usa agent-browser como CLI via runCommand", () => {
   expect(src).toContain("runCommand")
 })
 
-test("inyecta cookies via CDP (Network.setCookies) — no Playwright", () => {
-  const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
-  expect(src).toContain("Network.setCookies")
-  expect(src).toContain("inject-cookies.mjs")
+test("usa Playwright con session cookies (context.addCookies)", () => {
+  const agentSrc = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
+  const scriptSrc = readFileSync(resolve("scripts/pw/create-playlist.cjs"), "utf-8")
+  expect(agentSrc).toContain("runPlaywrightPlaylistFlow")
+  expect(agentSrc).toContain("runPlaywrightPlayerControl")
+  expect(scriptSrc).toContain("context.addCookies")
 })
 
-test("usa AX tree snapshot con click por referencia (@eN)", () => {
+test("mantiene agent-browser como capacidad auxiliar", () => {
   const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
-  expect(src).toContain("snapshot")
-  expect(src).toContain("agentClick")
+  expect(src).toContain("agent-browser")
+  expect(src).toContain("createSnapshot")
 })
 
 test("acciones con fallback a eval JS (no depende solo del AX tree)", () => {
@@ -60,10 +62,10 @@ test("acciones con fallback a eval JS (no depende solo del AX tree)", () => {
 
 // ─── Sin screenshots, sin Claude Haiku ───────────────────────────────────────
 
-test("no usa Playwright (chromium.launch eliminado)", () => {
+test("usa Playwright como runtime principal de automatización", () => {
   const src = readFileSync(resolve("lib/spotify-agent.ts"), "utf-8")
-  expect(src).not.toContain("chromium.launch")
-  expect(src).not.toContain("playwright")
+  expect(src).toContain("PLAYWRIGHT_NODE_MODULES")
+  expect(src).toContain("/tmp/pw-create-playlist.cjs")
 })
 
 test("no usa Claude Haiku para visión (screenshots eliminados)", () => {
