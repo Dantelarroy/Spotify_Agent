@@ -33,7 +33,23 @@ if (process.env.EMAIL_SERVER) {
 
 export const authConfig = {
   trustHost: true,
-  adapter: PrismaAdapter(prisma),
+  adapter: (() => {
+    const base = PrismaAdapter(prisma)
+    return Object.fromEntries(
+      Object.entries(base).map(([k, fn]) => [
+        k,
+        async (...args: unknown[]) => {
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            return await (fn as any)(...args)
+          } catch (e) {
+            console.error(`[adapter] ${k} FAILED:`, e)
+            throw e
+          }
+        },
+      ])
+    )
+  })(),
   providers,
   session: { strategy: "jwt" as const },
   cookies: {
