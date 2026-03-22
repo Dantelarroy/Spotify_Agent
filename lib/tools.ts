@@ -56,7 +56,16 @@ async function deezerSearchArtist(name: string): Promise<number | null> {
 function wrapSpotifyCall<T>(fn: () => Promise<T>, onExpired: () => Promise<void>): Promise<T> {
   return fn().catch(async (err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err)
+    const apiErr = err as { json?: unknown; text?: string; response?: { status?: number; url?: string } }
     console.error("[wrapSpotifyCall] error:", msg)
+    if (apiErr?.response?.status) {
+      console.error("[wrapSpotifyCall] response:", {
+        status: apiErr.response.status,
+        url: apiErr.response.url,
+      })
+    }
+    if (apiErr?.json) console.error("[wrapSpotifyCall] json:", JSON.stringify(apiErr.json).slice(0, 400))
+    if (apiErr?.text) console.error("[wrapSpotifyCall] text:", String(apiErr.text).slice(0, 400))
     // Invalidate only when we have strong evidence that the session is dead.
     const sessionDead = [
       "SPOTIFY_NOT_CONNECTED",

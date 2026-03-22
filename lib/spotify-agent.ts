@@ -171,6 +171,10 @@ export class SpotifyAgent {
 
     try {
       return await fn(sandbox)
+    } catch (err) {
+      const detail = this.describeSandboxError(err)
+      console.error("[sandbox] run failed:", detail)
+      throw err
     } finally {
       await sandbox.stop().catch(() => {})
     }
@@ -191,10 +195,15 @@ export class SpotifyAgent {
   // ─── Cookie injection via CDP ───────────────────────────────────────────────
 
   private async injectCookies(sandbox: Sandbox): Promise<void> {
-    await sandbox.writeFiles([
-      { path: "/root/cookies.json", content: Buffer.from(JSON.stringify(this.cookies)) },
-      { path: "/root/inject-cookies.mjs", content: Buffer.from(INJECT_COOKIES_MJS) },
-    ])
+    try {
+      await sandbox.writeFiles([
+        { path: "/root/cookies.json", content: Buffer.from(JSON.stringify(this.cookies)) },
+        { path: "/root/inject-cookies.mjs", content: Buffer.from(INJECT_COOKIES_MJS) },
+      ])
+    } catch (err) {
+      const detail = this.describeSandboxError(err)
+      throw new Error(`SANDBOX_STEP_FAILED:write-files:${detail}`)
+    }
     // Primera apertura — arranca Chrome con CDP en puerto 9222
     await this.runSandboxCommand(sandbox, "open-blank", "agent-browser", ["open", "about:blank"], 2)
     // Inyectar cookies httpOnly via CDP antes de navegar a Spotify
