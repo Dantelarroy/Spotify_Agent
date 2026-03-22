@@ -1,4 +1,5 @@
-import { NextRequest, NextResponse } from "next/server"
+import { NextResponse } from "next/server"
+import type { NextRequest } from "next/server"
 import { auth } from "@/lib/auth"
 import { saveSpotifySession } from "@/lib/spotify-session"
 import { chromium, type Browser, type BrowserContext } from "playwright"
@@ -15,7 +16,7 @@ interface CaptureSession {
 const captureSessions = new Map<string, CaptureSession>()
 
 // POST: Launch Playwright browser for Spotify login capture
-export async function POST(req: NextRequest) {
+export async function POST() {
   const session = await auth()
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })

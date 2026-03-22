@@ -3,11 +3,19 @@ import GoogleProvider from "next-auth/providers/google"
 import { PrismaAdapter } from "@auth/prisma-adapter"
 import { prisma } from "./db"
 import type { JWT } from "next-auth/jwt"
+import type { Session } from "next-auth"
 
 const providers = [
+  // Explicit token/userinfo endpoints bypass OIDC discovery.
+  // oauth4webapi checks "iss" in auth responses when Google's discovery doc says
+  // authorization_response_iss_parameter_supported=true — but Google doesn't send it.
+  // Bypassing discovery avoids that check entirely.
   GoogleProvider({
     clientId: process.env.AUTH_GOOGLE_ID!,
     clientSecret: process.env.AUTH_GOOGLE_SECRET!,
+    token: "https://oauth2.googleapis.com/token",
+    userinfo: "https://openidconnect.googleapis.com/v1/userinfo",
+    checks: ["pkce"],
   }),
 ]
 
@@ -26,7 +34,23 @@ if (process.env.EMAIL_SERVER) {
 
 export const authConfig = {
   trustHost: true,
-  adapter: PrismaAdapter(prisma),
+  adapter: (() => {
+    const base = PrismaAdapter(prisma)
+    return Object.fromEntries(
+      Object.entries(base).map(([k, fn]) => [
+        k,
+        async (...args: unknown[]) => {
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            return await (fn as any)(...args)
+          } catch (e) {
+            console.error(`[adapter] ${k} FAILED:`, e)
+            throw e
+          }
+        },
+      ])
+    )
+  })(),
   providers,
   session: { strategy: "jwt" as const },
   cookies: {
@@ -53,7 +77,10 @@ export const authConfig = {
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async session(params: any) {
-      const { session, token }: { session: any; token: JWT } = params
+      const { session, token }: {
+        session: Session & { user?: Session["user"] & { id?: string } }
+        token: JWT & { userId?: string }
+      } = params
       if (session.user) {
         let id: string | undefined = token.userId ?? token.sub ?? undefined
         // Fallback: look up by email (always present with Google OAuth)
