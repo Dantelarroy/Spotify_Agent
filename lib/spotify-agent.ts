@@ -39,12 +39,37 @@ import { readFileSync } from 'node:fs';
 
 const cookies = JSON.parse(readFileSync('/tmp/cookies.json', 'utf8'));
 
-const targets = await new Promise((ok, fail) => {
-  http.get('http://localhost:9222/json', (res) => {
-    let d = ''; res.on('data', c => d += c);
-    res.on('end', () => ok(JSON.parse(d))); res.on('error', fail);
-  });
-});
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function getTargetsWithRetry(maxAttempts = 20) {
+  let lastErr;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const targets = await new Promise((ok, fail) => {
+        const req = http.get('http://localhost:9222/json', (res) => {
+          let d = '';
+          res.on('data', (c) => d += c);
+          res.on('end', () => {
+            try {
+              ok(JSON.parse(d));
+            } catch (e) {
+              fail(e);
+            }
+          });
+          res.on('error', fail);
+        });
+        req.on('error', fail);
+      });
+      return targets;
+    } catch (err) {
+      lastErr = err;
+      await sleep(300);
+    }
+  }
+  throw lastErr ?? new Error('Could not connect to CDP on 127.0.0.1:9222');
+}
+
+const targets = await getTargetsWithRetry();
 
 const page = targets.find(t => t.type === 'page') ?? targets[0];
 if (!page?.webSocketDebuggerUrl) { console.error('no CDP target'); process.exit(1); }
