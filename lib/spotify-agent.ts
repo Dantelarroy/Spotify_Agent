@@ -322,9 +322,12 @@ export class SpotifyAgent {
       })())
     `).catch(() => "[]")
 
-    let candidates: string[] = []
-    try { candidates = JSON.parse(scraped) as string[] } catch { /* ignore */ }
-    const first = candidates.find((h) => /^\/playlist\/[a-zA-Z0-9]+$/.test(h))
+    let candidates: unknown = []
+    try { candidates = JSON.parse(scraped) } catch { /* ignore */ }
+    const candidateList = Array.isArray(candidates)
+      ? candidates.filter((v): v is string => typeof v === "string")
+      : []
+    const first = candidateList.find((h) => /^\/playlist\/[a-zA-Z0-9]+$/.test(h))
     if (!first) return null
     return `https://open.spotify.com${first}`
   }
