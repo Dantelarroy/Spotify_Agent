@@ -73,6 +73,69 @@ async function clickFirst(page, selectors, timeout = 1800) {
   return false;
 }
 
+async function isPlaylistNameVisible(page, expectedName) {
+  const target = normalizeName(expectedName);
+  return page.evaluate((n) => {
+    const nodes = [...document.querySelectorAll('h1,[data-testid="entityTitle"],[data-testid="playlist-title"],input[name="name"]')];
+    return nodes.some((el) => ((el.textContent || el.value || '').toLowerCase().replace(/\s+/g, ' ').trim()).includes(n));
+  }, target).catch(() => false);
+}
+
+async function renamePlaylistUnified(page, playlistName) {
+  const didOpenEdit = await clickFirst(page, [
+    'button[aria-label*="Edit details" i]',
+    'button[aria-label*="Edit playlist" i]',
+    'button:has-text("Edit details")',
+    'button:has-text("Edit playlist")',
+    '[data-testid*="edit" i]',
+  ], 1700);
+
+  if (didOpenEdit) {
+    await page.waitForTimeout(500);
+    const nameInput = page.locator('input[name="name"], input[placeholder*="name" i]').first();
+    if (await nameInput.count()) {
+      await nameInput.fill(playlistName, { timeout: 2000 }).catch(() => {});
+      await clickFirst(page, [
+        'button[aria-label="Save"]',
+        'button[type="submit"]',
+        'button:has-text("Save")',
+        'button:has-text("Guardar")',
+      ], 1500).catch(() => false);
+      await page.waitForTimeout(350);
+      if (await isPlaylistNameVisible(page, playlistName)) return true;
+    }
+  }
+
+  // Fallback: direct editable title/header replacement.
+  const editedDirect = await page.evaluate((nextName) => {
+    const candidates = [
+      '[data-testid="entityTitle"]',
+      '[data-testid="playlist-title"]',
+      'h1',
+      '[contenteditable="true"]',
+    ];
+    for (const sel of candidates) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      const isEditable = el.getAttribute('contenteditable') === 'true';
+      if (isEditable) {
+        el.focus();
+        document.execCommand('selectAll');
+        document.execCommand('insertText', false, nextName);
+        return true;
+      }
+    }
+    return false;
+  }, playlistName).catch(() => false);
+  if (editedDirect) {
+    await page.waitForTimeout(250);
+    await page.keyboard.press('Enter').catch(() => null);
+    await page.waitForTimeout(250);
+    if (await isPlaylistNameVisible(page, playlistName)) return true;
+  }
+  return false;
+}
+
 async function ensurePlaylistsView(page) {
   await page.goto('https://open.spotify.com/collection/playlists', { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(800);
@@ -602,49 +665,8 @@ try {
 
   result.phase = 'rename_playlist';
   const playlistName = String(input.name || 'New Playlist');
-  const didOpenEdit = await clickFirst(page, [
-    'button[aria-label*="Edit details" i]',
-    'button[aria-label*="Edit playlist" i]',
-    'button:has-text("Edit details")',
-    'button:has-text("Edit playlist")',
-  ], 1500);
-
-  if (didOpenEdit) {
-    await page.waitForTimeout(500);
-    const nameInput = page.locator('input[name="name"], input[placeholder*="name" i]').first();
-    if (await nameInput.count()) {
-      await nameInput.fill(playlistName, { timeout: 2000 }).catch(() => {});
-    }
-    await clickFirst(page, [
-      'button[aria-label="Save"]',
-      'button[type="submit"]',
-      'button:has-text("Save")',
-    ], 1500).catch(() => false);
-  } else {
-    // Fallback: direct editable title/header replacement.
-    await page.evaluate((nextName) => {
-      const candidates = [
-        '[data-testid="entityTitle"]',
-        '[data-testid="playlist-title"]',
-        'h1',
-        '[contenteditable="true"]',
-      ];
-      for (const sel of candidates) {
-        const el = document.querySelector(sel);
-        if (!el) continue;
-        const isEditable = el.getAttribute('contenteditable') === 'true';
-        if (isEditable) {
-          el.focus();
-          document.execCommand('selectAll');
-          document.execCommand('insertText', false, nextName);
-          return true;
-        }
-      }
-      return false;
-    }, playlistName).catch(() => false);
-    await page.waitForTimeout(250);
-    await page.keyboard.press('Enter').catch(() => null);
-  }
+  const renamed = await renamePlaylistUnified(page, playlistName);
+  trace('rename_playlist_done', { renamed });
 
   result.phase = 'add_tracks';
   const queries = (Array.isArray(input.trackQueries) ? input.trackQueries : [])
