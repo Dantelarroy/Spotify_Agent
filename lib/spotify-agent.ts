@@ -77,6 +77,24 @@ function extractPlaylistIdsFromHrefs(hrefs) {
   return [...new Set(ids)];
 }
 
+function normalizeName(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/\\s+/g, ' ')
+    .trim();
+}
+
+async function listLibraryPlaylistHrefs(page) {
+  return page.$$eval(
+    [
+      '[data-testid="rootlist"] a[href*="/playlist/"]',
+      '[aria-label*="Your Library" i] a[href*="/playlist/"]',
+      'nav a[href*="/playlist/"]',
+    ].join(','),
+    (els) => [...new Set(els.map((el) => el.getAttribute('href') || '').filter(Boolean))]
+  ).catch(() => []);
+}
+
 async function clickFirst(page, selectors, timeout = 1800) {
   for (const selector of selectors) {
     const locator = page.locator(selector).first();
@@ -141,8 +159,8 @@ try {
   if (cookies.length) await context.addCookies(cookies);
 
   page = await context.newPage();
-  result.phase = 'open_home';
-  await page.goto('https://open.spotify.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  result.phase = 'open_library';
+  await page.goto('https://open.spotify.com/collection/playlists', { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(1500);
 
   const currentUrl = page.url();
@@ -156,9 +174,7 @@ try {
     'button[data-testid*="accept"]',
   ]).catch(() => false);
 
-  const beforeHrefs = await page.$$eval('a[href*="/playlist/"]', (els) =>
-    [...new Set(els.map((el) => el.getAttribute('href') || ''))]
-  ).catch(() => []);
+  const beforeHrefs = await listLibraryPlaylistHrefs(page);
   const beforeIds = extractPlaylistIdsFromHrefs(beforeHrefs);
 
   result.phase = 'create_playlist';
@@ -196,25 +212,27 @@ try {
     await page.waitForTimeout(450);
     playlistId = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/)?.[1] || null;
     if (playlistId) break;
-    const afterHrefs = await page.$$eval('a[href*="/playlist/"]', (els) =>
-      [...new Set(els.map((el) => el.getAttribute('href') || ''))]
-    ).catch(() => []);
+    const afterHrefs = await listLibraryPlaylistHrefs(page);
     const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
     playlistId = afterIds.find((id) => !beforeIds.includes(id)) || null;
   }
 
   if (!playlistId) {
-    const afterHrefs = await page.$$eval('a[href*="/playlist/"]', (els) =>
-      [...new Set(els.map((el) => el.getAttribute('href') || ''))]
-    ).catch(() => []);
+    const afterHrefs = await listLibraryPlaylistHrefs(page);
     const afterIds = extractPlaylistIdsFromHrefs(afterHrefs);
-    playlistId = afterIds[0] || null;
+    const currentUrlId = page.url().match(/\\/playlist\\/([a-zA-Z0-9]+)/)?.[1] || null;
+    if (currentUrlId && !beforeIds.includes(currentUrlId)) {
+      playlistId = currentUrlId;
+    } else {
+      playlistId = afterIds.find((id) => !beforeIds.includes(id)) || null;
+    }
   }
 
   if (!playlistId) {
     result.debug = {
       currentUrl: page.url(),
       beforePlaylistCount: beforeIds.length,
+      beforeSample: beforeIds.slice(0, 6),
       phase: result.phase,
     };
     throw new Error('Could not navigate to playlist page');
@@ -274,10 +292,29 @@ try {
         continue;
       }
       await page.waitForTimeout(350);
-      const playlistOption = page.locator('[role="menuitem"], [role="option"]').filter({ hasText: playlistName }).first();
-      if (await playlistOption.count()) {
-        await playlistOption.click({ timeout: 1800 });
+      const byIdOption = page.locator('a[href*="/playlist/' + playlistId + '"], [role="menuitem"] a[href*="/playlist/' + playlistId + '"]').first();
+      if (await byIdOption.count()) {
+        await byIdOption.click({ timeout: 1800 });
         trackCount++;
+      } else {
+        const normalized = normalizeName(playlistName);
+        const playlistOptions = page.locator('[role="menuitem"], [role="option"]');
+        const count = await playlistOptions.count();
+        let clicked = false;
+        for (let i = 0; i < Math.min(count, 10); i++) {
+          const opt = playlistOptions.nth(i);
+          const txt = normalizeName(await opt.textContent());
+          if (txt.includes(normalized) || normalized.includes(txt)) {
+            await opt.click({ timeout: 1800 }).catch(() => {});
+            clicked = true;
+            break;
+          }
+        }
+        if (!clicked && count > 0) {
+          await playlistOptions.first().click({ timeout: 1800 }).catch(() => {});
+          clicked = true;
+        }
+        if (clicked) trackCount++;
       }
       await page.waitForTimeout(250);
     } catch {}
