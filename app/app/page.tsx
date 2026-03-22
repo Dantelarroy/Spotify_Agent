@@ -80,6 +80,10 @@ export default function ChatPage() {
     error?.message?.includes("MODEL_CREDITS_EXHAUSTED") ||
     error?.message?.toLowerCase().includes("insufficient credits") ||
     error?.message?.toLowerCase().includes("credit balance is too low")
+  const isModelUnavailableError =
+    error?.message?.includes("MODEL_NOT_AVAILABLE") ||
+    error?.message?.toLowerCase().includes("not_found_error") ||
+    error?.message?.toLowerCase().includes("model:")
 
   // Not connected state
   if (spotifyConnected === false) {
@@ -216,7 +220,9 @@ export default function ChatPage() {
                 ? <span>Spotify desconectado. <Link href="/connect-spotify" className="underline">Reconectá tu cuenta</Link>.</span>
                 : isModelCreditsError
                 ? "El proveedor de IA no tiene crédito/configuración suficiente. Revisá ANTHROPIC_API_KEY o billing."
-                : "Error al conectar. Intentá de nuevo."}
+                : isModelUnavailableError
+                ? "El modelo configurado no está disponible. Ajustá ANTHROPIC_MODEL o usá el default compatible."
+                : `Error al conectar. ${error.message ? `Detalle: ${error.message}` : "Intentá de nuevo."}`}
             </div>
           </div>
         )}

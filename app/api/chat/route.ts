@@ -70,7 +70,7 @@ export async function POST(req: Request) {
     })
 
     const modelMessages = await safeConvertMessages(messages)
-    const modelName = process.env.ANTHROPIC_MODEL ?? "claude-3-5-haiku-latest"
+    const modelName = process.env.ANTHROPIC_MODEL ?? "claude-3-5-haiku-20241022"
 
     const result = streamText({
       model: anthropic(modelName),
@@ -197,6 +197,16 @@ function normalizeChatError(error: unknown): {
       publicMessage: "MODEL_CREDITS_EXHAUSTED: El proveedor del modelo se quedó sin crédito.",
       status: 503,
       code: "MODEL_CREDITS_EXHAUSTED",
+      log: raw,
+    }
+  }
+
+  if (msg.includes("not_found_error") || (msg.includes("model:") && msg.includes("claude"))) {
+    return {
+      publicMessage:
+        "MODEL_NOT_AVAILABLE: El modelo configurado no existe o no está habilitado en tu cuenta.",
+      status: 503,
+      code: "MODEL_NOT_AVAILABLE",
       log: raw,
     }
   }
