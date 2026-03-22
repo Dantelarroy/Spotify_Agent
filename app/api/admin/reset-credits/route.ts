@@ -1,0 +1,100 @@
+import { NextRequest, NextResponse } from "next/server"
+import { auth } from "@/lib/auth"
+import { prisma } from "@/lib/db"
+
+export const runtime = "nodejs"
+
+type ResetBody = {
+  userId?: string
+  resetMonthly?: boolean
+  resetHourly?: boolean
+  setPlan?: "free" | "pro"
+}
+
+export async function POST(req: NextRequest) {
+  const session = await auth()
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+  }
+
+  let body: ResetBody = {}
+  try {
+    body = (await req.json()) as ResetBody
+  } catch {
+    body = {}
+  }
+
+  const callerUserId = session.user.id
+  const requestedUserId = (body.userId || "").trim()
+  const targetUserId = requestedUserId || callerUserId
+
+  const resetMonthly = body.resetMonthly !== false
+  const resetHourly = body.resetHourly !== false
+  const setPlan = body.setPlan
+
+  const adminKey = req.headers.get("x-admin-key") || ""
+  const expectedAdminKey = process.env.ADMIN_API_KEY || ""
+  const isAdminCall = targetUserId !== callerUserId || Boolean(setPlan)
+
+  if (isAdminCall) {
+    if (!expectedAdminKey || adminKey !== expectedAdminKey) {
+      return NextResponse.json({ error: "Forbidden (admin key required)" }, { status: 403 })
+    }
+  }
+
+  const monthStart = new Date()
+  monthStart.setDate(1)
+  monthStart.setHours(0, 0, 0, 0)
+
+  const updateData: {
+    messagesThisMonth?: number
+    periodStart?: Date
+    actionsThisHour?: number
+    lastHourStart?: Date
+    plan?: "free" | "pro"
+  } = {}
+
+  if (resetMonthly) {
+    updateData.messagesThisMonth = 0
+    updateData.periodStart = monthStart
+  }
+  if (resetHourly) {
+    updateData.actionsThisHour = 0
+    updateData.lastHourStart = new Date()
+  }
+  if (setPlan === "free" || setPlan === "pro") {
+    updateData.plan = setPlan
+  }
+
+  const sub = await prisma.subscription.upsert({
+    where: { userId: targetUserId },
+    create: {
+      userId: targetUserId,
+      plan: updateData.plan ?? "free",
+      messagesThisMonth: updateData.messagesThisMonth ?? 0,
+      periodStart: updateData.periodStart ?? monthStart,
+      actionsThisHour: updateData.actionsThisHour ?? 0,
+      lastHourStart: updateData.lastHourStart ?? new Date(),
+    },
+    update: updateData,
+    select: {
+      userId: true,
+      plan: true,
+      messagesThisMonth: true,
+      actionsThisHour: true,
+      periodStart: true,
+      lastHourStart: true,
+    },
+  })
+
+  return NextResponse.json({
+    ok: true,
+    reset: {
+      resetMonthly,
+      resetHourly,
+      setPlan: setPlan ?? null,
+    },
+    subscription: sub,
+  })
+}
+
