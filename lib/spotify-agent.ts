@@ -33,7 +33,7 @@ export interface SpotifyAgentCookie {
 
 // ─── CDP cookie injection script ──────────────────────────────────────────────
 // Corre dentro del microVM (Node 24 — WebSocket built-in, top-level await en .mjs)
-const INJECT_COOKIES_MJS = `
+const INJECT_COOKIES_MJS = String.raw`
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
 
@@ -92,7 +92,7 @@ ws.addEventListener('error', ev => { console.error('CDP error', ev.message); pro
 setTimeout(() => { if (!done) { console.error('timeout'); process.exit(1); } }, 8000);
 `.trim()
 
-const PLAYWRIGHT_CREATE_PLAYLIST_CJS = `
+const PLAYWRIGHT_CREATE_PLAYLIST_CJS = String.raw`
 const { readFileSync, writeFileSync } = require('node:fs');
 
 function extractPlaylistIdsFromHrefs(hrefs) {
